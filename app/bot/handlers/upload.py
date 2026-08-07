@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import tempfile
+from html import escape
 from pathlib import Path
 from uuid import uuid4
 
@@ -62,7 +63,7 @@ async def handle_document(
     current_state = await state.get_state()
     if current_state is not None:
         data = await state.get_data()
-        filename = data.get("original_filename", "предыдущий файл")
+        filename = escape(str(data.get("original_filename", "предыдущий файл")))
         await message.answer(
             f"Предыдущая загрузка ({filename}) ещё не завершена — сначала "
             "выберите для неё отдел или отмените (/cancel)."
@@ -99,7 +100,9 @@ async def handle_document(
             temp_path.unlink(missing_ok=True)
 
     if not result.is_valid or result.parsed is None:
-        reasons = "\n".join(f"• {reason}" for reason in result.rejection_reasons)
+        reasons = "\n".join(
+            f"• {escape(reason)}" for reason in result.rejection_reasons
+        )
         await message.answer(f"Файл отклонён:\n{reasons}")
         return
 
@@ -397,11 +400,18 @@ def _business_error_message(exc: Exception) -> str:
 
 
 def _success_message(result: AddResult) -> str:
+    debt = (
+        f", долг {result.total_debt:,.2f}"
+        if result.total_debt is not None
+        else ""
+    )
     if result.status == AuditCycleStatus.COMPLETED:
-        return f"Аудит за {result.report_date:%d.%m.%Y}: 5/5 — комплект собран."
+        return (
+            f"Аудит за {result.report_date:%d.%m.%Y}: 5/5 — комплект собран{debt}."
+        )
     return (
         f"Аудит за {result.report_date:%d.%m.%Y}: "
-        f"{len(result.summary.present)}/5 файлов получено."
+        f"{len(result.summary.present)}/5 файлов получено{debt}."
     )
 
 

@@ -161,10 +161,33 @@ async def test_department_selection_saves_new_file(
     await handle_department_callback(callback, state, stage3_session)  # type: ignore[arg-type]
 
     assert "1/5" in callback.message.answers[-1][0]
+    assert "долг" in callback.message.answers[-1][0]
     assert callback.answer_count == 1
     assert state.state is None
     async with stage3_session.begin():
         assert await stage3_session.scalar(select(func.count(SourceFile.id))) == 1
+
+
+@pytest.mark.asyncio
+async def test_second_document_while_fsm_open_is_rejected_without_overwriting(
+    stage3_session: AsyncSession,
+    tmp_path: Path,
+) -> None:
+    state = FakeState()
+    first = await receive_valid(stage3_session, state)
+    assert "Выберите отдел" in first.answers[-1][0]
+    first_token = state.data["upload_token"]
+    first_filename = state.data["original_filename"]
+
+    second_path = tmp_path / "second.xls"
+    build_regional_xls(_basic_spec("15.07.2026"), second_path)
+    second = FakeMessage(document_from(second_path))
+    await handle_document(second, state, FakeBot(), stage3_session)  # type: ignore[arg-type]
+
+    assert "ещё не завершена" in second.answers[-1][0]
+    assert first_filename in second.answers[-1][0]
+    assert state.data["upload_token"] == first_token
+    assert state.state == UploadStates.choosing_department.state
 
 
 @pytest.mark.asyncio

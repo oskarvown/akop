@@ -7,6 +7,8 @@ head`). Если БД недоступна — тест пропускается
 """
 from __future__ import annotations
 
+import asyncio
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -38,7 +40,8 @@ async def db_session():
     try:
         async with session_maker() as session:
             await session.execute(select(1))
-    except OperationalError as exc:  # pragma: no cover - зависит от окружения
+    except (OperationalError, OSError) as exc:  # pragma: no cover - зависит от окружения
+        # asyncpg may raise ConnectionRefusedError (OSError) before SQLAlchemy wraps it.
         await engine.dispose()
         pytest.skip(f"Локальный PostgreSQL недоступен: {exc}")
 
@@ -266,3 +269,48 @@ async def test_rejecting_invalid_file_does_not_persist(db_session) -> None:
         "Stage 2 не создаёт SourceFile для невалидного файла — статус 'invalid' "
         "зарезервирован в схеме, но не используется до Stage 3"
     )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_persist_reuses_manager_group_and_counterparty(
+    db_session,
+) -> None:
+    """Parallel saves for one department must not fail on identity unique indexes."""
+    path = FIXTURES_DIR / "regional_valid_basic.xls"
+    base = validate_confirmed_template_file(path)
+    assert base.is_valid and base.parsed is not None
+
+    maker = async_sessionmaker(bind=db_session.bind, expire_on_commit=False)
+
+    async def persist_variant(day: int, sha_suffix: str) -> None:
+        result = replace(
+            base,
+            parsed=replace(base.parsed, report_date=base.parsed.report_date.replace(day=day)),
+        )
+        async with maker() as session:
+            async with session.begin():
+                await persist_valid_source_file(
+                    session,
+                    result=result,
+                    department=Department.REGIONAL,
+                    sha256=f"{compute_sha256(path)}::{sha_suffix}",
+                    original_filename=f"{sha_suffix}.xls",
+                )
+
+    await asyncio.gather(
+        persist_variant(11, "a"),
+        persist_variant(15, "b"),
+    )
+
+    manager_groups = (
+        await db_session.scalars(
+            select(ManagerGroup).where(ManagerGroup.department == Department.REGIONAL)
+        )
+    ).all()
+    assert len(manager_groups) == 2
+
+    counterparties = (await db_session.scalars(select(Counterparty))).all()
+    assert len(counterparties) == 3
+
+    files = (await db_session.scalars(select(SourceFile))).all()
+    assert len(files) == 2

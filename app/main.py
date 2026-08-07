@@ -11,7 +11,8 @@ import logging
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.memory import MemoryStorage, SimpleEventIsolation
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.bot.handlers import get_root_router
 from app.bot.middlewares.allowlist import AllowlistMiddleware
@@ -25,6 +26,31 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def create_dispatcher(
+    *,
+    allowed_user_id: int,
+    session_maker: async_sessionmaker[AsyncSession] | None = None,
+) -> Dispatcher:
+    """Собирает Dispatcher с FSM MemoryStorage и SimpleEventIsolation.
+
+    Без isolation два параллельных update одного чата оба видят пустой FSM и
+    перезаписывают загрузку; SimpleEventIsolation сериализует обработку по ключу
+    USER_IN_CHAT, поэтому второй документ получает «ещё не завершена».
+    """
+    dispatcher = Dispatcher(
+        storage=MemoryStorage(),
+        events_isolation=SimpleEventIsolation(),
+    )
+    dispatcher.update.outer_middleware(
+        AllowlistMiddleware(allowed_user_id=allowed_user_id)
+    )
+    dispatcher.update.outer_middleware(
+        DatabaseSessionMiddleware(session_maker=session_maker)
+    )
+    dispatcher.include_router(get_root_router())
+    return dispatcher
+
+
 async def main() -> None:
     settings = get_settings()
 
@@ -32,16 +58,7 @@ async def main() -> None:
         token=settings.bot_token,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
-    dispatcher = Dispatcher(storage=MemoryStorage())
-
-    # Регистрация как outer middleware на `update` (а не на message/callback_query
-    # по отдельности) гарантирует, что авторизация проверяется для любого текущего
-    # и будущего типа события до маршрутизации в handler — см. docstring мидлвари.
-    allowlist = AllowlistMiddleware(allowed_user_id=settings.allowed_user_id)
-    dispatcher.update.outer_middleware(allowlist)
-    dispatcher.update.outer_middleware(DatabaseSessionMiddleware())
-
-    dispatcher.include_router(get_root_router())
+    dispatcher = create_dispatcher(allowed_user_id=settings.allowed_user_id)
 
     logger.info("Дебиторка-бот запускается (allowed_user_id=%s)", settings.allowed_user_id)
     try:

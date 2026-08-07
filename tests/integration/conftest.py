@@ -22,7 +22,8 @@ async def stage3_session_maker():
     try:
         async with maker() as session:
             await session.execute(select(1))
-    except OperationalError as exc:  # pragma: no cover - environment dependent
+    except (OperationalError, OSError) as exc:  # pragma: no cover - environment dependent
+        # asyncpg may raise ConnectionRefusedError (OSError) before SQLAlchemy wraps it.
         await engine.dispose()
         pytest.skip(f"Локальный PostgreSQL недоступен: {exc}")
 

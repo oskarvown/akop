@@ -5,10 +5,15 @@
 переиспользует существующий `id`, новый не создаётся при повторном появлении
 в другом `SourceFile`. `DebtPosition` создаётся заново на каждый файл (это
 снимок конкретного отчёта, а не идентичность).
+
+Создание использует PostgreSQL `ON CONFLICT DO NOTHING`, чтобы параллельные
+загрузки одного отдела за разные даты не роняли валидный файл на
+`uq_manager_group_identity` / `uq_counterparty_identity`.
 """
 from __future__ import annotations
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.enums import Department
@@ -29,17 +34,23 @@ async def _get_or_create_manager_group(
     session: AsyncSession, department: Department, raw_name: str
 ) -> ManagerGroup:
     normalized = normalize_name(raw_name)
-    existing = await session.scalar(
+    await session.execute(
+        insert(ManagerGroup)
+        .values(
+            department=department,
+            raw_name=raw_name,
+            normalized_name=normalized,
+        )
+        .on_conflict_do_nothing(constraint="uq_manager_group_identity")
+    )
+    group = await session.scalar(
         select(ManagerGroup).where(
             ManagerGroup.department == department,
             ManagerGroup.normalized_name == normalized,
         )
     )
-    if existing is not None:
-        return existing
-    group = ManagerGroup(department=department, raw_name=raw_name, normalized_name=normalized)
-    session.add(group)
-    await session.flush()
+    if group is None:  # pragma: no cover - conflict path always leaves a row
+        raise RuntimeError("ManagerGroup upsert left no row")
     return group
 
 
@@ -47,19 +58,23 @@ async def _get_or_create_counterparty(
     session: AsyncSession, manager_group_id: int, raw_name: str
 ) -> Counterparty:
     normalized = normalize_name(raw_name)
-    existing = await session.scalar(
+    await session.execute(
+        insert(Counterparty)
+        .values(
+            manager_group_id=manager_group_id,
+            raw_name=raw_name,
+            normalized_name=normalized,
+        )
+        .on_conflict_do_nothing(constraint="uq_counterparty_identity")
+    )
+    counterparty = await session.scalar(
         select(Counterparty).where(
             Counterparty.manager_group_id == manager_group_id,
             Counterparty.normalized_name == normalized,
         )
     )
-    if existing is not None:
-        return existing
-    counterparty = Counterparty(
-        manager_group_id=manager_group_id, raw_name=raw_name, normalized_name=normalized
-    )
-    session.add(counterparty)
-    await session.flush()
+    if counterparty is None:  # pragma: no cover - conflict path always leaves a row
+        raise RuntimeError("Counterparty upsert left no row")
     return counterparty
 
 
