@@ -1,4 +1,4 @@
-"""Allowlist-мидлварь: бот закрытый, отвечает только Александру в private chat.
+"""Allowlist-мидлварь: бот закрытый, отвечает только разрешённым user_id в private chat.
 
 Регистрируется как **outer middleware на observer `update`**
 (`dispatcher.update.outer_middleware(...)`), а не на отдельных observer'ах
@@ -15,10 +15,10 @@ inline_query, chat_member, my_chat_member и т.д.), и авторизация 
 до пользовательского кода) — поэтому эти поля уже доступны на момент вызова
 нашей мидлвари.
 
-Правила (Roadmap: единственный разрешённый пользователь; Stage 1 clarification:
-бот работает только в private chat):
+Правила (Stage 1 clarification: бот работает только в private chat; allowlist
+может содержать несколько Telegram user_id):
 
-1. Апдевты без определённого пользователя или от чужого `user_id` — отклоняются.
+1. Апдейты без определённого пользователя или от чужого `user_id` — отклоняются.
 2. Апдейты с определённым чатом, чей `type != private` (group/supergroup/channel),
    отклоняются даже для разрешённого пользователя.
 3. Апдейты без привязанного чата (например, `inline_query`) чат не проверяют
@@ -27,7 +27,7 @@ inline_query, chat_member, my_chat_member и т.д.), и авторизация 
 from __future__ import annotations
 
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from typing import Any
 
 from aiogram import BaseMiddleware
@@ -38,10 +38,12 @@ logger = logging.getLogger(__name__)
 
 
 class AllowlistMiddleware(BaseMiddleware):
-    """Пропускает только апдейты разрешённого пользователя в private chat."""
+    """Пропускает только апдейты разрешённых пользователей в private chat."""
 
-    def __init__(self, allowed_user_id: int) -> None:
-        self._allowed_user_id = allowed_user_id
+    def __init__(self, allowed_user_ids: Iterable[int]) -> None:
+        self._allowed_user_ids = frozenset(allowed_user_ids)
+        if not self._allowed_user_ids:
+            raise ValueError("allowed_user_ids must not be empty")
 
     async def __call__(
         self,
@@ -52,7 +54,7 @@ class AllowlistMiddleware(BaseMiddleware):
         user: User | None = data.get("event_from_user")
         chat: Chat | None = data.get("event_chat")
 
-        if user is None or user.id != self._allowed_user_id:
+        if user is None or user.id not in self._allowed_user_ids:
             logger.warning(
                 "Отклонён апдейт от неразрешённого пользователя: user_id=%s",
                 user.id if user else None,

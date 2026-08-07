@@ -74,7 +74,7 @@
 Значения ниже — плейсхолдеры для `.env.example`, реальные значения предоставляются перед деплоем (Stage 7):
 
 - `BOT_TOKEN` — токен Telegram-бота (создаёт и хранит Александр);
-- `ALLOWED_USER_ID` — Telegram `user_id` Александра для allowlist;
+- `ALLOWED_USER_IDS` — один или несколько Telegram `user_id` через запятую для allowlist (private chat only);
 - `DB_*` (host/port/name/user/password) — параметры PostgreSQL;
 - `AUDIT_IDLE_TIMEOUT_SECONDS` — тайм-аут завершения сбора файлов (не хардкодить, только через конфиг/env);
 - `LLM_API_KEY`, `LLM_MODEL` — для fallback-парсинга неоднозначных комментариев (Roadmap §6.1); провайдер не выбран.

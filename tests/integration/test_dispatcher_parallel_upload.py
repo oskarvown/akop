@@ -120,7 +120,7 @@ async def test_parallel_document_updates_reject_second_while_first_open(
     bot.download = _download  # type: ignore[method-assign]
 
     dispatcher = create_dispatcher(
-        allowed_user_id=ALLOWED_USER_ID,
+        allowed_user_ids={ALLOWED_USER_ID},
         session_maker=stage3_session_maker,
     )
 

@@ -63,7 +63,9 @@ def _build_dispatcher() -> Dispatcher:
     """Собирает Dispatcher так же, как `app/main.py`: allowlist — outer middleware
     на `update`, а не на отдельных observer'ах."""
     dispatcher = Dispatcher()
-    dispatcher.update.outer_middleware(AllowlistMiddleware(allowed_user_id=ALLOWED_USER_ID))
+    dispatcher.update.outer_middleware(
+        AllowlistMiddleware(allowed_user_ids={ALLOWED_USER_ID})
+    )
     dispatcher.include_router(get_root_router())
     return dispatcher
 

@@ -8,6 +8,8 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from collections.abc import Iterable
+
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -28,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 def create_dispatcher(
     *,
-    allowed_user_id: int,
+    allowed_user_ids: Iterable[int],
     session_maker: async_sessionmaker[AsyncSession] | None = None,
 ) -> Dispatcher:
     """Собирает Dispatcher с FSM MemoryStorage и SimpleEventIsolation.
@@ -42,7 +44,7 @@ def create_dispatcher(
         events_isolation=SimpleEventIsolation(),
     )
     dispatcher.update.outer_middleware(
-        AllowlistMiddleware(allowed_user_id=allowed_user_id)
+        AllowlistMiddleware(allowed_user_ids=allowed_user_ids)
     )
     dispatcher.update.outer_middleware(
         DatabaseSessionMiddleware(session_maker=session_maker)
@@ -58,9 +60,12 @@ async def main() -> None:
         token=settings.bot_token,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
-    dispatcher = create_dispatcher(allowed_user_id=settings.allowed_user_id)
+    dispatcher = create_dispatcher(allowed_user_ids=settings.allowed_user_ids)
 
-    logger.info("Дебиторка-бот запускается (allowed_user_id=%s)", settings.allowed_user_id)
+    logger.info(
+        "Дебиторка-бот запускается (allowed_user_ids=%s)",
+        sorted(settings.allowed_user_ids),
+    )
     try:
         await dispatcher.start_polling(bot)
     finally:

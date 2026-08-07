@@ -18,7 +18,9 @@ from aiogram.types import CallbackQuery, Chat, Message, User
 
 from app.bot.middlewares.allowlist import AllowlistMiddleware
 
-ALLOWED_USER_ID = 4242
+ALLOWED_USER_IDS = frozenset({4242, 7777})
+PRIMARY_USER_ID = 4242
+SECONDARY_USER_ID = 7777
 STRANGER_USER_ID = 9999
 
 
@@ -35,13 +37,14 @@ def _make_message(chat: Chat) -> Message:
 
 
 @pytest.mark.asyncio
-async def test_allowed_user_in_private_chat_passes() -> None:
-    middleware = AllowlistMiddleware(allowed_user_id=ALLOWED_USER_ID)
+@pytest.mark.parametrize("user_id", [PRIMARY_USER_ID, SECONDARY_USER_ID])
+async def test_allowed_user_in_private_chat_passes(user_id: int) -> None:
+    middleware = AllowlistMiddleware(allowed_user_ids=ALLOWED_USER_IDS)
     handler = AsyncMock(return_value="handled")
     chat = _make_chat(ChatType.PRIVATE)
     event = _make_message(chat)
     data: dict[str, Any] = {
-        "event_from_user": _make_user(ALLOWED_USER_ID),
+        "event_from_user": _make_user(user_id),
         "event_chat": chat,
     }
 
@@ -53,7 +56,7 @@ async def test_allowed_user_in_private_chat_passes() -> None:
 
 @pytest.mark.asyncio
 async def test_stranger_is_blocked() -> None:
-    middleware = AllowlistMiddleware(allowed_user_id=ALLOWED_USER_ID)
+    middleware = AllowlistMiddleware(allowed_user_ids=ALLOWED_USER_IDS)
     handler = AsyncMock(return_value="handled")
     chat = _make_chat(ChatType.PRIVATE)
     event = _make_message(chat)
@@ -71,12 +74,12 @@ async def test_stranger_is_blocked() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("chat_type", [ChatType.GROUP, ChatType.SUPERGROUP])
 async def test_allowed_user_in_group_or_supergroup_is_blocked(chat_type: str) -> None:
-    middleware = AllowlistMiddleware(allowed_user_id=ALLOWED_USER_ID)
+    middleware = AllowlistMiddleware(allowed_user_ids=ALLOWED_USER_IDS)
     handler = AsyncMock(return_value="handled")
     chat = _make_chat(chat_type)
     event = _make_message(chat)
     data: dict[str, Any] = {
-        "event_from_user": _make_user(ALLOWED_USER_ID),
+        "event_from_user": _make_user(PRIMARY_USER_ID),
         "event_chat": chat,
     }
 
@@ -88,7 +91,7 @@ async def test_allowed_user_in_group_or_supergroup_is_blocked(chat_type: str) ->
 
 @pytest.mark.asyncio
 async def test_unauthorized_callback_query_is_blocked() -> None:
-    middleware = AllowlistMiddleware(allowed_user_id=ALLOWED_USER_ID)
+    middleware = AllowlistMiddleware(allowed_user_ids=ALLOWED_USER_IDS)
     handler = AsyncMock(return_value="handled")
     chat = _make_chat(ChatType.PRIVATE)
     message = _make_message(chat)
@@ -115,11 +118,11 @@ async def test_unauthorized_callback_query_is_blocked() -> None:
 async def test_event_without_chat_is_not_blocked_by_chat_type() -> None:
     """Апдейты без чата (например, inline_query) не должны отклоняться проверкой
     типа чата — блокируется только по несоответствию пользователя."""
-    middleware = AllowlistMiddleware(allowed_user_id=ALLOWED_USER_ID)
+    middleware = AllowlistMiddleware(allowed_user_ids=ALLOWED_USER_IDS)
     handler = AsyncMock(return_value="handled")
     event = _make_message(_make_chat(ChatType.PRIVATE))
     data: dict[str, Any] = {
-        "event_from_user": _make_user(ALLOWED_USER_ID),
+        "event_from_user": _make_user(PRIMARY_USER_ID),
         "event_chat": None,
     }
 

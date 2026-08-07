@@ -31,7 +31,9 @@ class Settings(BaseSettings):
 
     # Telegram
     bot_token: str = Field(..., alias="BOT_TOKEN")
-    allowed_user_id: int = Field(..., alias="ALLOWED_USER_ID")
+    # Comma-separated Telegram user ids; parsed via `allowed_user_ids` property.
+    # Kept as str so pydantic-settings does not JSON-decode the dotenv value.
+    allowed_user_ids_raw: str = Field(..., alias="ALLOWED_USER_IDS")
     max_upload_size_bytes: int = Field(
         20 * 1024 * 1024,
         alias="MAX_UPLOAD_SIZE_BYTES",
@@ -51,12 +53,25 @@ class Settings(BaseSettings):
     llm_api_key: str | None = Field(None, alias="LLM_API_KEY")
     llm_model: str | None = Field(None, alias="LLM_MODEL")
 
+    @field_validator("allowed_user_ids_raw")
+    @classmethod
+    def _non_empty_allowed_user_ids(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("ALLOWED_USER_IDS must contain at least one id")
+        # Fail fast on malformed tokens.
+        _ = _parse_allowed_user_ids(value)
+        return value
+
     @field_validator("audit_idle_timeout_seconds", "max_upload_size_bytes")
     @classmethod
     def _positive_timeout(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("AUDIT_IDLE_TIMEOUT_SECONDS must be positive")
         return value
+
+    @property
+    def allowed_user_ids(self) -> frozenset[int]:
+        return _parse_allowed_user_ids(self.allowed_user_ids_raw)
 
     @property
     def database_url(self) -> str:
@@ -72,18 +87,34 @@ class Settings(BaseSettings):
         return str(dsn)
 
 
+def _parse_allowed_user_ids(value: str) -> frozenset[int]:
+    parts = [
+        part.strip()
+        for part in value.replace(";", ",").split(",")
+        if part.strip()
+    ]
+    if not parts:
+        raise ValueError("ALLOWED_USER_IDS must contain at least one id")
+    try:
+        return frozenset(int(part) for part in parts)
+    except ValueError as exc:
+        raise ValueError(
+            "ALLOWED_USER_IDS must be a comma-separated list of integers"
+        ) from exc
+
+
 def _build_settings() -> Settings:
     try:
         return Settings()  # type: ignore[call-arg]
     except ValidationError as exc:
-        missing = sorted(
-            {
-                str(error["loc"][0])
-                for error in exc.errors()
-                if error.get("type") == "missing" and error.get("loc")
-            }
-        )
-        details = ", ".join(missing) if missing else str(exc)
+        missing: set[str] = set()
+        for error in exc.errors():
+            if error.get("type") != "missing" or not error.get("loc"):
+                continue
+            field_name = str(error["loc"][0])
+            field = Settings.model_fields.get(field_name)
+            missing.add(str(field.alias) if field is not None and field.alias else field_name)
+        details = ", ".join(sorted(missing)) if missing else str(exc)
         raise ConfigurationError(
             "Не заданы обязательные переменные окружения: "
             f"{details}. Скопируйте .env.example в .env и заполните значения "
