@@ -1,0 +1,20 @@
+[Unit]
+Description=Debitor-bot — Telegram bot for weekly accounts receivable audit
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=debitor-bot
+WorkingDirectory=/opt/debitor-bot
+EnvironmentFile=/opt/debitor-bot/.env
+ExecStart=/opt/debitor-bot/.venv/bin/python -m app.main
+Restart=on-failure
+RestartSec=5
+
+# Базовое ужесточение (Stage 7 может расширить)
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,13 @@
+/private_inputs/
+
+# AppleDouble resource-fork файлы (артефакт внешнего SSD, не относится к проекту)
+._*
+
+# Python / окружение (Stage 1)
+.venv/
+__pycache__/
+*.pyc
+.env
+.pytest_cache/
+
+.DS_Store

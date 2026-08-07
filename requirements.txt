@@ -1,0 +1,13 @@
+# «Дебиторка-бот» — Stage 1 зависимости (без Docker, см. docs/ASSUMPTIONS.md §2.3)
+
+aiogram==3.15.0
+SQLAlchemy==2.0.36
+greenlet==3.1.1
+asyncpg==0.30.0
+alembic==1.14.0
+pydantic==2.9.2
+pydantic-settings==2.6.1
+
+# Excel-парсер (Stage 2, зависимости уже фиксируются для совместимости среды)
+openpyxl==3.1.5
+xlrd==2.0.1
