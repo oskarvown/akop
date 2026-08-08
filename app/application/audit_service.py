@@ -225,7 +225,10 @@ async def find_audit_cycle_by_report_date_for_update(
 
 
 async def get_or_create_audit_cycle(
-    session: AsyncSession, report_date: dt.date
+    session: AsyncSession,
+    report_date: dt.date,
+    *,
+    notification_chat_id: int,
 ) -> AuditCycle:
     """Internal helper called only inside an add transaction."""
     cycle = await session.scalar(
@@ -239,10 +242,19 @@ async def get_or_create_audit_cycle(
     cycle = AuditCycle(
         report_date=report_date,
         status=AuditCycleStatus.COLLECTING,
+        notification_chat_id=notification_chat_id,
     )
     session.add(cycle)
     await session.flush()
     return cycle
+
+
+def _reset_reminder_series(cycle: AuditCycle) -> None:
+    """Clear idle-reminder progress and any in-flight claim after real activity."""
+    cycle.reminder_count = 0
+    cycle.last_reminder_at = None
+    cycle.reminder_claim_token = None
+    cycle.reminder_claimed_at = None
 
 
 def assert_cycle_mutable(cycle: AuditCycle) -> None:
@@ -289,11 +301,16 @@ async def add_source_file_atomic(
     sha256: str,
     original_filename: str | None,
     report_date: dt.date,
+    notification_chat_id: int,
 ) -> AddResult:
     for attempt in range(2):
         try:
             async with session.begin():
-                cycle = await get_or_create_audit_cycle(session, report_date)
+                cycle = await get_or_create_audit_cycle(
+                    session,
+                    report_date,
+                    notification_chat_id=notification_chat_id,
+                )
                 assert_cycle_mutable(cycle)
                 await _assert_sha256_available(session, sha256)
                 await _assert_department_available(session, cycle.id, department)
@@ -307,6 +324,7 @@ async def add_source_file_atomic(
                     audit_cycle_id=cycle.id,
                     lifecycle_status=SourceFileLifecycle.ACTIVE,
                 )
+                _reset_reminder_series(cycle)
                 cycle.last_activity_at = func.clock_timestamp()
                 await session.flush()
                 summary, finalized = await finalize_if_complete(session, cycle)
@@ -381,6 +399,7 @@ async def replace_source_file_atomic(
                 audit_cycle_id=cycle.id,
                 lifecycle_status=SourceFileLifecycle.ACTIVE,
             )
+            _reset_reminder_series(cycle)
             cycle.last_activity_at = func.clock_timestamp()
             await session.flush()
             summary, finalized = await finalize_if_complete(session, cycle)
@@ -477,6 +496,7 @@ async def withdraw_source_file_atomic(
         if previous is not None:
             previous.lifecycle_status = SourceFileLifecycle.ACTIVE
 
+        _reset_reminder_series(cycle)
         cycle.last_activity_at = func.clock_timestamp()
         await session.flush()
         summary = await cycle_status_summary(session, cycle.id)

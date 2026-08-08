@@ -18,7 +18,7 @@
 | 0 | Анализ репозитория и контракт данных | **Выполнен (ревизия 5)** | Модель «файл = отдел» подтверждена; единый data contract (17-колоночный fingerprint) подтверждён реальными файлами отдела «Региональный» и, по бизнес-решению Александра, действует как единый шаблон всех отделов; 30.07.2026 состав отделов расширен до **5** (добавлен «Фокин», см. «Обновление состава отделов» ниже) |
 | 1 | Каркас приложения | **Выполнен и закрыт пользователем** | `app/`, `alembic/` (async, без доменных моделей), pydantic-settings, aiogram + allowlist (outer middleware, private-only), systemd unit, без Docker |
 | 2 | Excel-парсер и валидация | **Подтверждён и официально закрыт пользователем** | Парсер/валидатор/reconciliation/доменные модели/первая миграция реализованы по единому шаблону, применимому к любому отделу (не хардкодят `Department.REGIONAL`); проверены на 4 реальных + 5 обезличенных файлах и параметризованным тестом на всех отделах, включая добавленный 30.07.2026 «Фокин» (см. «Отчёт по Stage 2» и «Обновление состава отделов») |
-| 3 | Недельный цикл и пакетная загрузка | **Часть 1 реализована** | Telegram-приём Excel, ручной выбор отдела, `AuditCycle` по `report_date`, атомарные add/replace, глобальный SHA-256 дедуп, `/status`, FSM и PostgreSQL-защита гонок; idle timeout/напоминания/присвоение `expired` остаются частью 2 |
+| 3 | Недельный цикл и пакетная загрузка | **Часть 1 + часть 2 реализованы** | Часть 1: Telegram-приём Excel, отделы, `AuditCycle`, add/replace/undo, SHA-дедуп, `/status`, FSM. Часть 2: idle reminders + `EXPIRED` по PostgreSQL-scheduler (`notification_chat_id`, claim-token, backoff); Redis/FSM recovery/reopen отложены |
 | 4 | Первый аудит | Не начат | Уровни агрегации: общий итог → отдел → ManagerGroup → контрагент → договор → документ |
 | 5 | Сравнение недель | Не начат | Заблокирован до 2 полных комплектов (10 файлов); базовая логика matching/переноса истории уже определена и не требует дополнительных решений для старта |
 | 6 | Обещания и алерты | Не начат | — |
@@ -66,7 +66,7 @@ AND все 5 SourceFile имеют report_date этого AuditCycle
 AND все 5 файлов прошли обязательную валидацию
 ```
 
-В части 1 цикл атомарно становится `completed` сразу при строгом 5/5. Idle timeout, напоминания и присвоение `expired` не входят в часть 1; значение `expired` только зарезервировано в enum. Неполный комплект никогда не становится `completed`. Любой статус, отличный от `collecting`, неизменяем сервисными add/replace-операциями.
+В части 1 цикл атомарно становится `completed` сразу при строгом 5/5. В части 2 (Stage 3.2) idle timeout шлёт предметные напоминания и после `AUDIT_MAX_REMINDERS` + `AUDIT_EXPIRE_GRACE_SECONDS` переводит неполный `collecting` в `expired` (никогда в `completed`). Любой статус, отличный от `collecting`, неизменяем сервисными add/replace/undo.
 
 ## Предлагаемая структура репозитория (Roadmap §5, без создания кода на Stage 0)
 
@@ -126,7 +126,7 @@ Roadmap §5/§8 предлагает Docker Compose; Stage 0 **явно заме
 
 ## Следующий этап
 
-Stage 0 ревизии 5 подтверждён. **Stage 1 подтверждён и официально закрыт пользователем** (см. «Отчёт по Stage 1» ниже). **Stage 2 подтверждён и официально закрыт пользователем** (см. «Отчёт по Stage 2» → «Итоговый статус Stage 2» ниже); 30.07.2026 в состав отделов добавлен «Фокин» без переоткрытия Stage 2. **Stage 3, часть 1 реализована и проверена 07.08.2026**; следующий логичный шаг — Stage 3, часть 2 (idle timeout и предметные напоминания о недостающих отделах).
+Stage 0 ревизии 5 подтверждён. **Stage 1–2 закрыты.** **Stage 3, часть 1 и часть 2 (idle reminders / EXPIRED) реализованы.** Следующий логичный шаг — Stage 4 (первый аудит / отчёты).
 
 ## Отчёт по Stage 1 (каркас приложения)
 
@@ -368,3 +368,12 @@ fokin    — «Фокин»
 - `/status` режет ответ на сообщения ≤4096 символов; успешная загрузка показывает сумму долга; имена файлов/причины отказа экранируются для `ParseMode.HTML`.
 - Полный тестовый набор после исправлений review: `95 passed` (включая parallel Dispatcher upload, status split, concurrent identity upsert).
 - Исправление undo (08.08.2026): soft-revoke `REVOKED`, подтверждаемое `/undo`, без reopen COMPLETED; Alembic `b4d200000001`; полный `pytest` зелёный на реальной PostgreSQL.
+
+## Отчёт по Stage 3, часть 2 (08.08.2026)
+
+- Фоновый `IdleReminderScheduler` в процессе бота: старт/stop вместе с polling; состояние только в PostgreSQL.
+- `AuditCycle`: `notification_chat_id` (из `AUDIT_NOTIFICATION_CHAT_ID` при создании), `reminder_count`, `last_reminder_at`, `reminder_claim_token`/`reminder_claimed_at`, `expired_at`. Миграция `c5e300000001` без `get_settings` (временный server_default `743971617` → backfill → drop default).
+- Claim-lease против двойной отправки; send timeout < claim TTL; RetryAfter учитывается; error backoff без tight retry; count только после успешного send.
+- Activity (add/replace/undo) сбрасывает серию и claim; `/status` не сбрасывает. EXPIRE никогда не ставит COMPLETED. Гонка expire vs activity — два сериализованных исхода.
+- FSM после рестарта не восстанавливается; stale callback: «Загрузите файл заново.» Redis / reopen / INVALID — вне scope.
+- Проверено: alembic upgrade→downgrade -1→upgrade; **131 passed** на реальной PostgreSQL; scheduler start/stop; ruff на новых модулях.

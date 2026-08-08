@@ -64,10 +64,12 @@ AuditCycle
 ```text
 AuditCycle.status = collecting:  0–4 уникальных отдела с активным файлом каждый (0, 1, 2, 3 или 4 — нормальные промежуточные состояния)
 AuditCycle.status = completed:   ровно 5 валидных отделов, все SourceFile прошли структурную валидацию, одна общая report_date
-AuditCycle.status = expired:     значение зарезервировано для Stage 3, часть 2; в части 1 не присваивается
+AuditCycle.status = expired:     неполный collecting после AUDIT_MAX_REMINDERS успешных напоминаний + AUDIT_EXPIRE_GRACE_SECONDS без активности (Stage 3.2); никогда не означает completed
 ```
 
-Утверждение «один аудит = ровно 5 файлов» относится только к состоянию `completed`. Во время сбора (`collecting`) число активных файлов может быть от 0 до 4; добавление пятого уникального отдела атомарно переводит цикл в `completed`. Неполный комплект никогда не становится `completed`. Изменения разрешены только при `status == collecting`; `completed` и будущий `expired` неизменяемы.
+Поля Stage 3.2 на `audit_cycles`: `notification_chat_id` (фиксируется при создании из `AUDIT_NOTIFICATION_CHAT_ID`), `reminder_count`, `last_reminder_at`, `reminder_claim_token` / `reminder_claimed_at` (lease на отправку), `expired_at`.
+
+Утверждение «один аудит = ровно 5 файлов» относится только к состоянию `completed`. Во время сбора (`collecting`) число активных файлов может быть от 0 до 4; добавление пятого уникального отдела атомарно переводит цикл в `completed`. Неполный комплект никогда не становится `completed`. Изменения разрешены только при `status == collecting`; `completed` и `expired` неизменяемы.
 
 ### 2.2. ManagerGroup вместо «Manager»
 

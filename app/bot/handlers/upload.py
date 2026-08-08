@@ -192,7 +192,7 @@ async def handle_department_callback(
 ) -> None:
     try:
         if await state.get_state() != UploadStates.choosing_department.state:
-            await _callback_message(callback, "Эта кнопка устарела.")
+            await _callback_message(callback, "Эта кнопка устарела. Загрузите файл заново.")
             return
         parts = (callback.data or "").split(":")
         if len(parts) != 3:
@@ -201,7 +201,7 @@ async def handle_department_callback(
         _, token, department_value = parts
         data = await state.get_data()
         if data.get("upload_token") != token:
-            await _callback_message(callback, "Эта кнопка устарела.")
+            await _callback_message(callback, "Эта кнопка устарела. Загрузите файл заново.")
             return
 
         try:
@@ -253,7 +253,7 @@ async def handle_department_confirm_callback(
 ) -> None:
     try:
         if await state.get_state() != UploadStates.confirming_department.state:
-            await _callback_message(callback, "Эта кнопка устарела.")
+            await _callback_message(callback, "Эта кнопка устарела. Загрузите файл заново.")
             return
         parts = (callback.data or "").split(":")
         if len(parts) != 3:
@@ -262,7 +262,7 @@ async def handle_department_confirm_callback(
         _, token, action = parts
         data = await state.get_data()
         if data.get("upload_token") != token:
-            await _callback_message(callback, "Эта кнопка устарела.")
+            await _callback_message(callback, "Эта кнопка устарела. Загрузите файл заново.")
             return
 
         if action == "cancel":
@@ -332,7 +332,7 @@ async def handle_new_cycle_callback(
 ) -> None:
     try:
         if await state.get_state() != UploadStates.confirming_new_cycle.state:
-            await _callback_message(callback, "Эта кнопка устарела.")
+            await _callback_message(callback, "Эта кнопка устарела. Загрузите файл заново.")
             return
         parts = (callback.data or "").split(":")
         if len(parts) != 3:
@@ -341,7 +341,7 @@ async def handle_new_cycle_callback(
         _, token, action = parts
         data = await state.get_data()
         if data.get("upload_token") != token:
-            await _callback_message(callback, "Эта кнопка устарела.")
+            await _callback_message(callback, "Эта кнопка устарела. Загрузите файл заново.")
             return
         if action == "cancel":
             await state.clear()
@@ -370,7 +370,7 @@ async def handle_replace_callback(
 ) -> None:
     try:
         if await state.get_state() != UploadStates.confirming_replace.state:
-            await _callback_message(callback, "Эта кнопка устарела.")
+            await _callback_message(callback, "Эта кнопка устарела. Загрузите файл заново.")
             return
         parts = (callback.data or "").split(":")
         if len(parts) != 3:
@@ -379,7 +379,7 @@ async def handle_replace_callback(
         _, token, action = parts
         data = await state.get_data()
         if data.get("upload_token") != token:
-            await _callback_message(callback, "Эта кнопка устарела.")
+            await _callback_message(callback, "Эта кнопка устарела. Загрузите файл заново.")
             return
         if action == "cancel":
             await state.clear()
@@ -439,7 +439,7 @@ async def handle_undo_offer_callback(
 ) -> None:
     try:
         if await state.get_state() != UploadStates.can_undo.state:
-            await _callback_message(callback, "Эта кнопка устарела.")
+            await _callback_message(callback, "Эта кнопка устарела. Загрузите файл заново.")
             return
         parts = (callback.data or "").split(":")
         if len(parts) != 3:
@@ -448,7 +448,7 @@ async def handle_undo_offer_callback(
         _, token, action = parts
         data = await state.get_data()
         if data.get("undo_token") != token:
-            await _callback_message(callback, "Эта кнопка устарела.")
+            await _callback_message(callback, "Эта кнопка устарела. Загрузите файл заново.")
             return
         if action != "start":
             await _callback_message(callback, "Некорректное действие.")
@@ -471,7 +471,7 @@ async def handle_undo_confirm_callback(
 ) -> None:
     try:
         if await state.get_state() != UploadStates.confirming_undo.state:
-            await _callback_message(callback, "Эта кнопка устарела.")
+            await _callback_message(callback, "Эта кнопка устарела. Загрузите файл заново.")
             return
         parts = (callback.data or "").split(":")
         if len(parts) != 3:
@@ -480,7 +480,7 @@ async def handle_undo_confirm_callback(
         _, token, action = parts
         data = await state.get_data()
         if data.get("undo_token") != token:
-            await _callback_message(callback, "Эта кнопка устарела.")
+            await _callback_message(callback, "Эта кнопка устарела. Загрузите файл заново.")
             return
 
         if action == "keep":
@@ -620,6 +620,7 @@ async def _persist_add(
             sha256=str(data["sha256"]),
             original_filename=str(data["original_filename"]),
             report_date=data["report_date"],  # type: ignore[arg-type]
+            notification_chat_id=get_settings().audit_notification_chat_id,
         )
     except (
         CycleImmutableError,

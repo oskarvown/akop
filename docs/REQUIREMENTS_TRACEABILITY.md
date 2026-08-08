@@ -30,10 +30,12 @@
 | Изменение числа ManagerGroup — не ошибка | `tests/unit/domain/test_manager_group_count_dynamic.py` | `app/domain/models/manager_group.py` |
 | ManagerGroup как организационная группа/филиал, не только ФИО | `tests/unit/domain/test_manager_group_opaque_name.py` | `app/domain/models/manager_group.py` |
 | Стабильная идентичность ManagerGroup между двумя аудитами (один и тот же `manager_group_id` по каноническому ключу `department_id + normalized_name`, не новый ID на каждый цикл) | `tests/integration/test_manager_group_stable_across_cycles.py` | `app/domain/models/manager_group.py`, `app/application/audit_service.py` |
-| Восстановление незавершённого аудита после перезапуска (неполный комплект) | Stage 3, часть 2 (ещё не реализовано) | будущий `recovery.py` |
-| Восстановление аудита после перезапуска (полный, но не финализированный) | Stage 3, часть 2 (ещё не реализовано) | будущий `recovery.py` |
-| Idle timeout, напоминания и присвоение expired | Stage 3, часть 2 (ещё не реализовано) | будущий scheduler/recovery-модуль |
-| Неполный комплект после timeout не переходит в completed | Stage 3, часть 2 (ещё не реализовано) | `app/application/audit_service.py` |
+| Восстановление незавершённого аудита после перезапуска (данные в PostgreSQL) | `tests/integration/test_idle_reminders_stage32.py::test_scheduler_restart_continues_from_postgres`; `/status` из БД | `app/bot/scheduler/idle_scheduler.py`, `app/bot/handlers/status.py` |
+| Незавершённый FSM выбора отдела после рестарта | не восстанавливается; stale callback → загрузить файл заново | `app/bot/handlers/upload.py` (`MemoryStorage`) |
+| Idle timeout, предметные напоминания, EXPIRED | `tests/integration/test_idle_reminders_stage32.py`, `tests/unit/test_idle_policy.py` | `app/application/idle_policy.py`, `idle_reminder_service.py`, `app/bot/scheduler/idle_scheduler.py` |
+| Неполный комплект после timeout не переходит в completed | `test_expire_after_max_successful_reminders_and_grace` | `app/application/idle_reminder_service.py` |
+| Reminder claim без двойной отправки; Telegram error не увеличивает count | `test_parallel_claims_only_one_send`, `test_telegram_error_does_not_increment_count` | `idle_reminder_service.py` |
+| Гонка expire vs activity — только два сериализованных исхода | `test_race_expire_vs_activity_serialized_outcomes` | `audit_service.py`, `idle_reminder_service.py` |
 
 ## Excel-парсер и валидация (Roadmap §4.2, §6, уточнено Stage 0)
 

@@ -32,7 +32,7 @@ def test_summary_is_complete_only_for_strict_five_of_five() -> None:
 def test_assert_cycle_mutable_rejects_every_non_collecting_status(
     status: AuditCycleStatus,
 ) -> None:
-    cycle = AuditCycle(report_date=dt.date(2026, 7, 30), status=status)
+    cycle = AuditCycle(report_date=dt.date(2026, 7, 30), status=status, notification_chat_id=743971617)
 
     with pytest.raises(CycleImmutableError):
         assert_cycle_mutable(cycle)
@@ -40,6 +40,7 @@ def test_assert_cycle_mutable_rejects_every_non_collecting_status(
 
 def test_assert_cycle_mutable_accepts_collecting() -> None:
     cycle = AuditCycle(
+        notification_chat_id=743971617,
         report_date=dt.date(2026, 7, 30),
         status=AuditCycleStatus.COLLECTING,
     )

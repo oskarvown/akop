@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import datetime as dt
 import enum
+import uuid
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Date, DateTime, Enum, UniqueConstraint, func
+from sqlalchemy import BigInteger, Date, DateTime, Enum, Integer, UniqueConstraint, func
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.infrastructure.database.base import Base
@@ -46,6 +48,24 @@ class AuditCycle(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     completed_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Filled once at cycle creation from AUDIT_NOTIFICATION_CHAT_ID; never updated
+    # by add/replace/undo. Reminders go only here — not to all allowlisted users.
+    notification_chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    reminder_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    last_reminder_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    reminder_claim_token: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    reminder_claimed_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    expired_at: Mapped[dt.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
 

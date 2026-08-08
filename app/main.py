@@ -1,4 +1,4 @@
-"""Точка входа «Дебиторка-бот» (Stage 1: каркас приложения, без Docker).
+"""Точка входа «Дебиторка-бот» (Stage 1 + Stage 3.2 scheduler).
 
 Запуск: `python -m app.main` внутри активированного venv,
 с переменными окружения из `.env` (см. `.env.example`).
@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-
 from collections.abc import Iterable
 
 from aiogram import Bot, Dispatcher
@@ -19,7 +18,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.bot.handlers import get_root_router
 from app.bot.middlewares.allowlist import AllowlistMiddleware
 from app.bot.middlewares.database import DatabaseSessionMiddleware
+from app.bot.scheduler.idle_scheduler import IdleReminderScheduler
 from app.config import get_settings
+from app.infrastructure.database.session import get_session_maker
 
 logging.basicConfig(
     level=logging.INFO,
@@ -55,20 +56,32 @@ def create_dispatcher(
 
 async def main() -> None:
     settings = get_settings()
+    session_maker = get_session_maker()
 
     bot = Bot(
         token=settings.bot_token,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
-    dispatcher = create_dispatcher(allowed_user_ids=settings.allowed_user_ids)
+    dispatcher = create_dispatcher(
+        allowed_user_ids=settings.allowed_user_ids,
+        session_maker=session_maker,
+    )
+    scheduler = IdleReminderScheduler(
+        bot=bot,
+        session_maker=session_maker,
+        settings=settings,
+    )
 
     logger.info(
-        "Дебиторка-бот запускается (allowed_user_ids=%s)",
+        "Дебиторка-бот запускается (allowed_user_ids=%s, notify_chat_id=%s)",
         sorted(settings.allowed_user_ids),
+        settings.audit_notification_chat_id,
     )
+    await scheduler.start()
     try:
         await dispatcher.start_polling(bot)
     finally:
+        await scheduler.stop()
         await bot.session.close()
 
 

@@ -7,35 +7,19 @@ from aiogram.types import Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.application.audit_service import CycleStatusView, list_cycle_statuses
-from app.bot.keyboards.department import DEPARTMENT_LABELS
-from app.domain.models import AuditCycleStatus
+from app.bot.messages.status_format import format_cycle_block
 
 # Telegram Bot API hard limit for message text.
 TELEGRAM_MESSAGE_LIMIT = 4096
 
-
-def format_cycle_block(cycle: CycleStatusView) -> str:
-    present = ", ".join(
-        DEPARTMENT_LABELS[item]
-        for item in sorted(cycle.summary.present, key=lambda item: item.value)
-    )
-    missing = ", ".join(
-        DEPARTMENT_LABELS[item]
-        for item in sorted(cycle.summary.missing, key=lambda item: item.value)
-    )
-    if cycle.status == AuditCycleStatus.COLLECTING:
-        return "\n".join(
-            [
-                f"Сбор за {cycle.report_date:%d.%m.%Y}: "
-                f"{len(cycle.summary.present)}/5",
-                f"Получены: {present or '—'}",
-                f"Не хватает: {missing or '—'}",
-            ]
-        )
-    return (
-        f"Завершён {cycle.report_date:%d.%m.%Y}: "
-        f"5/5, общий долг {cycle.total_debt:,.2f}"
-    )
+# Re-export for tests that import from this module historically.
+__all__ = [
+    "TELEGRAM_MESSAGE_LIMIT",
+    "format_cycle_block",
+    "get_status_router",
+    "handle_status",
+    "split_status_messages",
+]
 
 
 def split_status_messages(

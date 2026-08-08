@@ -164,6 +164,7 @@ async def seed_file(
         sha256=sha,
         original_filename=f"{sha}.xls",
         report_date=result.parsed.report_date,
+        notification_chat_id=743971617,
     )
 
 
@@ -455,6 +456,7 @@ async def test_completed_cycle_is_blocked_by_handler(
     async with stage3_session.begin():
         stage3_session.add(
             AuditCycle(
+                notification_chat_id=743971617,
                 report_date=valid_result.parsed.report_date,
                 status=AuditCycleStatus.COMPLETED,
             )
@@ -625,10 +627,12 @@ async def test_status_shows_all_collecting_cycles_and_recent_completed(
         sha256="status-new",
         original_filename="status-new.xls",
         report_date=newer,
+        notification_chat_id=743971617,
     )
     async with stage3_session.begin():
         stage3_session.add(
             AuditCycle(
+                notification_chat_id=743971617,
                 report_date=completed_date,
                 status=AuditCycleStatus.COMPLETED,
                 completed_at=dt.datetime.now(tz=dt.timezone.utc),

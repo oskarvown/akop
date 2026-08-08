@@ -36,8 +36,8 @@ source .venv/bin/activate
 pip install -r requirements-dev.txt
 
 cp .env.example .env
-# заполнить BOT_TOKEN, ALLOWED_USER_IDS, DB_* (значения роли/БД из шага выше),
-# AUDIT_IDLE_TIMEOUT_SECONDS
+# заполнить BOT_TOKEN, ALLOWED_USER_IDS, DB_*,
+# AUDIT_* (см. .env.example — idle reminders Stage 3.2)
 
 # применить миграции (после появления доменных моделей на Stage 2+)
 alembic upgrade head

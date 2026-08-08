@@ -7,7 +7,13 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from pydantic import Field, PostgresDsn, ValidationError, field_validator
+from pydantic import (
+    Field,
+    PostgresDsn,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -46,8 +52,26 @@ class Settings(BaseSettings):
     db_user: str = Field(..., alias="DB_USER")
     db_password: str = Field(..., alias="DB_PASSWORD")
 
-    # Недельный цикл (Stage 3) — не хардкодится, см. docs/IMPLEMENTATION_PLAN.md
+    # Недельный цикл / Stage 3.2 idle reminders — не хардкодится
     audit_idle_timeout_seconds: int = Field(..., alias="AUDIT_IDLE_TIMEOUT_SECONDS")
+    audit_reminder_interval_seconds: int = Field(
+        ..., alias="AUDIT_REMINDER_INTERVAL_SECONDS"
+    )
+    audit_max_reminders: int = Field(..., alias="AUDIT_MAX_REMINDERS")
+    audit_expire_grace_seconds: int = Field(..., alias="AUDIT_EXPIRE_GRACE_SECONDS")
+    audit_notification_chat_id: int = Field(..., alias="AUDIT_NOTIFICATION_CHAT_ID")
+    audit_scheduler_poll_seconds: int = Field(
+        ..., alias="AUDIT_SCHEDULER_POLL_SECONDS"
+    )
+    audit_reminder_claim_ttl_seconds: int = Field(
+        ..., alias="AUDIT_REMINDER_CLAIM_TTL_SECONDS"
+    )
+    audit_reminder_send_timeout_seconds: int = Field(
+        ..., alias="AUDIT_REMINDER_SEND_TIMEOUT_SECONDS"
+    )
+    audit_reminder_error_backoff_seconds: int = Field(
+        ..., alias="AUDIT_REMINDER_ERROR_BACKOFF_SECONDS"
+    )
 
     # LLM fallback (Roadmap §6.1, провайдер не выбран — Stage 6)
     llm_api_key: str | None = Field(None, alias="LLM_API_KEY")
@@ -62,12 +86,53 @@ class Settings(BaseSettings):
         _ = _parse_allowed_user_ids(value)
         return value
 
-    @field_validator("audit_idle_timeout_seconds", "max_upload_size_bytes")
+    @field_validator(
+        "audit_idle_timeout_seconds",
+        "audit_reminder_interval_seconds",
+        "audit_scheduler_poll_seconds",
+        "audit_reminder_claim_ttl_seconds",
+        "audit_reminder_send_timeout_seconds",
+        "audit_reminder_error_backoff_seconds",
+        "max_upload_size_bytes",
+    )
     @classmethod
-    def _positive_timeout(cls, value: int) -> int:
+    def _positive_int(cls, value: int) -> int:
         if value <= 0:
-            raise ValueError("AUDIT_IDLE_TIMEOUT_SECONDS must be positive")
+            raise ValueError("value must be positive")
         return value
+
+    @field_validator("audit_max_reminders")
+    @classmethod
+    def _max_reminders_at_least_one(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("AUDIT_MAX_REMINDERS must be >= 1")
+        return value
+
+    @field_validator("audit_expire_grace_seconds")
+    @classmethod
+    def _non_negative_grace(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("AUDIT_EXPIRE_GRACE_SECONDS must be >= 0")
+        return value
+
+    @field_validator("audit_notification_chat_id")
+    @classmethod
+    def _nonzero_chat_id(cls, value: int) -> int:
+        if value == 0:
+            raise ValueError("AUDIT_NOTIFICATION_CHAT_ID must be non-zero")
+        return value
+
+    @model_validator(mode="after")
+    def _send_timeout_less_than_claim_ttl(self) -> Settings:
+        if (
+            self.audit_reminder_send_timeout_seconds
+            >= self.audit_reminder_claim_ttl_seconds
+        ):
+            raise ValueError(
+                "AUDIT_REMINDER_SEND_TIMEOUT_SECONDS must be strictly less than "
+                "AUDIT_REMINDER_CLAIM_TTL_SECONDS"
+            )
+        return self
 
     @property
     def allowed_user_ids(self) -> frozenset[int]:

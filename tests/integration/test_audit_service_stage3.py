@@ -46,6 +46,7 @@ FIXTURE = (
     / "regional_valid_basic.xls"
 )
 REPORT_DATE = dt.date(2026, 7, 30)
+NOTIFY_CHAT_ID = 743971617
 
 
 @pytest.fixture
@@ -67,6 +68,7 @@ async def add(
     *,
     sha: str,
     report_date: dt.date = REPORT_DATE,
+    notification_chat_id: int = NOTIFY_CHAT_ID,
 ):
     dated = result_for_date(result, report_date)
     return await add_source_file_atomic(
@@ -76,6 +78,7 @@ async def add(
         sha256=sha,
         original_filename=f"{sha}.xls",
         report_date=report_date,
+        notification_chat_id=notification_chat_id,
     )
 
 
@@ -337,7 +340,7 @@ async def test_add_and_replace_reject_immutable_cycles(
     status: AuditCycleStatus,
 ) -> None:
     async with stage3_session.begin():
-        cycle = AuditCycle(report_date=REPORT_DATE, status=status)
+        cycle = AuditCycle(report_date=REPORT_DATE, status=status, notification_chat_id=743971617)
         stage3_session.add(cycle)
 
     with pytest.raises(CycleImmutableError):
@@ -417,7 +420,7 @@ async def test_partial_unique_index_rejects_two_active_department_files(
 ) -> None:
     with pytest.raises(IntegrityError):
         async with stage3_session.begin():
-            cycle = AuditCycle(report_date=REPORT_DATE)
+            cycle = AuditCycle(report_date=REPORT_DATE, notification_chat_id=743971617)
             stage3_session.add(cycle)
             await stage3_session.flush()
             stage3_session.add_all(
@@ -434,7 +437,7 @@ async def test_read_dtos_are_safe_with_expire_on_commit_and_legacy_rows(
     stage3_session: AsyncSession,
 ) -> None:
     async with stage3_session.begin():
-        cycle = AuditCycle(report_date=REPORT_DATE)
+        cycle = AuditCycle(report_date=REPORT_DATE, notification_chat_id=743971617)
         stage3_session.add(cycle)
         await stage3_session.flush()
         active = _minimal_source("lookup-active", cycle.id, SourceFileLifecycle.ACTIVE)
@@ -528,6 +531,7 @@ async def test_enum_values_roundtrip_through_orm(
     async with stage3_session.begin():
         cycles = [
             AuditCycle(
+                notification_chat_id=743971617,
                 report_date=REPORT_DATE + dt.timedelta(days=index),
                 status=status,
             )
@@ -579,7 +583,7 @@ async def test_integrity_error_retry_opens_new_transaction_and_keeps_session_usa
         begin_count["n"] += 1
         return real_begin(*args, **kwargs)
 
-    async def flaky_get_or_create(session, report_date):
+    async def flaky_get_or_create(session, report_date, *, notification_chat_id):
         if begin_count["n"] == 1:
             class FakeOrig(Exception):
                 pass
@@ -592,7 +596,9 @@ async def test_integrity_error_retry_opens_new_transaction_and_keeps_session_usa
                     '"uq_audit_cycle_report_date"'
                 ),
             )
-        return await real_get_or_create(session, report_date)
+        return await real_get_or_create(
+            session, report_date, notification_chat_id=notification_chat_id
+        )
 
     monkeypatch.setattr(stage3_session, "begin", counting_begin)
     monkeypatch.setattr(audit_service, "get_or_create_audit_cycle", flaky_get_or_create)

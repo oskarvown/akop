@@ -76,8 +76,22 @@
 - `BOT_TOKEN` — токен Telegram-бота (создаёт и хранит Александр);
 - `ALLOWED_USER_IDS` — один или несколько Telegram `user_id` через запятую для allowlist (private chat only);
 - `DB_*` (host/port/name/user/password) — параметры PostgreSQL;
-- `AUDIT_IDLE_TIMEOUT_SECONDS` — тайм-аут завершения сбора файлов (не хардкодить, только через конфиг/env);
+- `AUDIT_IDLE_TIMEOUT_SECONDS` — idle до первого напоминания (production default 86400);
+- `AUDIT_REMINDER_INTERVAL_SECONDS` — интервал между успешными напоминаниями (86400);
+- `AUDIT_MAX_REMINDERS` — число успешных напоминаний до grace (2);
+- `AUDIT_EXPIRE_GRACE_SECONDS` — пауза после последнего успешного напоминания до EXPIRED (86400);
+- `AUDIT_NOTIFICATION_CHAT_ID` — единственный получатель напоминаний (Саша); пишется в `AuditCycle.notification_chat_id` при создании цикла;
+- `AUDIT_SCHEDULER_POLL_SECONDS` — период опроса scheduler (60);
+- `AUDIT_REMINDER_CLAIM_TTL_SECONDS` — TTL claim-lease (300);
+- `AUDIT_REMINDER_SEND_TIMEOUT_SECONDS` — timeout Telegram send, строго меньше claim TTL (30);
+- `AUDIT_REMINDER_ERROR_BACKOFF_SECONDS` — мин. пауза после ошибки Telegram перед повторным claim (900);
 - `LLM_API_KEY`, `LLM_MODEL` — для fallback-парсинга неоднозначных комментариев (Roadmap §6.1); провайдер не выбран.
+
+### 4.1. Ограничения доставки напоминаний (Stage 3.2)
+
+- Exactly-once с Telegram невозможен: между успешным `send_message` и записью `reminder_count` есть crash window → после TTL возможен редкий повтор.
+- Activity сразу после pre-send recheck может привести к доставке устаревшего текста, но `record` обязан стать no-op (claim очищен). PG-транзакция во время Telegram API не удерживается.
+- Ошибка Telegram не увеличивает `reminder_count` и не двигает к EXPIRED; повтор не чаще error backoff (не каждые 60 с бесконечно).
 
 ## 5. Прочие допущения
 
