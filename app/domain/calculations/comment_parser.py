@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 
+COMMENT_PARSER_VERSION = "1"
+
 
 class CommentParseOutcome(str, Enum):
     EMPTY = "empty"
@@ -74,7 +76,14 @@ def apply_report_year_rule(
         return None
 
 
-def parse_comment(comment_raw: str | None, *, report_date: dt.date) -> CommentParseResult:
+def parse_comment(
+    comment_raw: str | None,
+    *,
+    report_date: dt.date,
+    parser_version: str = COMMENT_PARSER_VERSION,
+) -> CommentParseResult:
+    if parser_version != COMMENT_PARSER_VERSION:
+        raise ValueError(f"unsupported_parser_version:{parser_version}")
     text = (comment_raw or "").strip()
     if not text:
         return CommentParseResult(outcome=CommentParseOutcome.EMPTY)

@@ -17,8 +17,14 @@ from sqlalchemy.sql import func
 from app.application.enriched_workbook import build_enriched_excel_bytes
 from app.application.report_delivery_service import enqueue_automatic_delivery
 from app.domain.calculations.comment_parser import (
+    COMMENT_PARSER_VERSION,
     CommentParseOutcome,
     parse_comment,
+)
+from app.domain.calculations.comment_redaction import (
+    REDACTION_VERSION,
+    redact_comment_text,
+    redact_counterparty_label,
 )
 from app.domain.models import (
     AuditArtifact,
@@ -50,6 +56,12 @@ logger = logging.getLogger(__name__)
 ENRICHED_GENERATOR_VERSION = "enriched-1"
 ENRICHED_SCHEMA_VERSION = "enriched-sheet-1"
 
+# Runtime supports only locked Stage 4.4 version "1" implementations.
+SUPPORTED_PARSER_VERSIONS = frozenset({COMMENT_PARSER_VERSION})
+SUPPORTED_PROMPT_VERSIONS = frozenset({"1"})
+SUPPORTED_SCHEMA_VERSIONS_LLM = frozenset({"1"})
+SUPPORTED_REDACTION_VERSIONS = frozenset({REDACTION_VERSION})
+
 
 class EnrichmentConflictError(RuntimeError):
     """Conflicting analysis payload for an existing immutable row."""
@@ -57,6 +69,10 @@ class EnrichmentConflictError(RuntimeError):
 
 class EnrichmentInvariantError(RuntimeError):
     """Broken enrichment/artifact invariant."""
+
+
+class EnrichmentVersionCompatibilityError(RuntimeError):
+    """Frozen job metadata is not executable by this runtime."""
 
 
 @dataclass(frozen=True)
@@ -92,6 +108,32 @@ def _versions(settings: object) -> dict[str, str]:
         "redaction_version": str(settings.comment_redaction_version),  # type: ignore[attr-defined]
         "model_name": str(model),
     }
+
+
+def _job_versions(job: CommentEnrichmentJob) -> dict[str, str]:
+    """Frozen versions from the job row — never live settings."""
+    return {
+        "parser_version": str(job.parser_version),
+        "prompt_version": str(job.prompt_version),
+        "schema_version_llm": str(job.schema_version_llm),
+        "redaction_version": str(job.redaction_version),
+        "model_name": str(job.model_name),
+    }
+
+
+def assert_runtime_supports_job(job: CommentEnrichmentJob) -> None:
+    """Fail closed if frozen metadata cannot be executed by this binary."""
+    checks = (
+        ("parser_version", job.parser_version, SUPPORTED_PARSER_VERSIONS),
+        ("prompt_version", job.prompt_version, SUPPORTED_PROMPT_VERSIONS),
+        ("schema_version_llm", job.schema_version_llm, SUPPORTED_SCHEMA_VERSIONS_LLM),
+        ("redaction_version", job.redaction_version, SUPPORTED_REDACTION_VERSIONS),
+    )
+    for name, value, supported in checks:
+        if str(value) not in supported:
+            raise EnrichmentVersionCompatibilityError(
+                f"unsupported_frozen_{name}:{value}"
+            )
 
 
 def _stable_json(value: Any) -> str:
@@ -672,14 +714,14 @@ async def complete_enrichment(
         )
 
 
-def _make_llm_client(settings: object) -> CommentLlmClient | None:
+def _make_llm_client(
+    settings: object, *, model_name: str
+) -> CommentLlmClient | None:
     api_key = getattr(settings, "openrouter_api_key", None) or getattr(
         settings, "llm_api_key", None
     )
-    model = getattr(settings, "openrouter_model", None) or getattr(
-        settings, "llm_model", None
-    )
-    if not api_key or not model:
+    model = (model_name or "").strip()
+    if not api_key or not model or model == "none":
         return None
     return OpenRouterClient(
         api_key=str(api_key),
@@ -702,13 +744,30 @@ async def run_claimed_enrichment(
 ) -> CompleteEnrichmentResult | None:
     """Process snapshot comments under run timeout; build XLSX outside DB txn."""
     run_timeout = float(settings.comment_enrichment_run_timeout_seconds)  # type: ignore[attr-defined]
-    versions = _versions(settings)
-    client = llm_client if llm_client is not None else _make_llm_client(settings)
 
     async with session_maker() as session:
         job = await session.get(CommentEnrichmentJob, claim.job_id)
         if job is None:
             return None
+        try:
+            assert_runtime_supports_job(job)
+        except EnrichmentVersionCompatibilityError as exc:
+            async with session_maker() as s2:
+                await fail_enrichment(
+                    s2,
+                    job_id=claim.job_id,
+                    claim_token=claim.claim_token,
+                    error=str(exc),
+                    settings=settings,
+                    now_utc=now_utc,
+                )
+            return None
+        versions = _job_versions(job)
+        client = (
+            llm_client
+            if llm_client is not None
+            else _make_llm_client(settings, model_name=versions["model_name"])
+        )
         report = await session.get(AuditReport, job.audit_report_id)
         cycle = (
             await session.get(AuditCycle, report.audit_cycle_id)
@@ -756,7 +815,11 @@ async def run_claimed_enrichment(
                 report_date=report_date,
                 versions=versions,
             )
-            parsed = parse_comment(comment_raw, report_date=report_date)
+            parsed = parse_comment(
+                comment_raw,
+                report_date=report_date,
+                parser_version=versions["parser_version"],
+            )
             if parsed.outcome is CommentParseOutcome.RESOLVED:
                 async with session_maker() as session:
                     await record_comment_analysis(
@@ -799,11 +862,18 @@ async def run_claimed_enrichment(
                 done_ids.add(position_id)
                 continue
 
+            redacted_comment = redact_comment_text(
+                comment_raw, redaction_version=versions["redaction_version"]
+            )
+            redacted_label = redact_counterparty_label(
+                str(snap.get("counterparty_label") or "") or None,
+                redaction_version=versions["redaction_version"],
+            )
             try:
                 facts = await client.analyze_comment(
-                    comment_raw=comment_raw,
+                    comment_raw=redacted_comment,
                     report_date=report_date,
-                    counterparty_label=str(snap.get("counterparty_label") or ""),
+                    counterparty_label=redacted_label,
                 )
             except OpenRouterTransientError:
                 raise
@@ -819,8 +889,8 @@ async def run_claimed_enrichment(
                         source=CommentAnalysisSource.UNPARSED,
                         analysis_status=CommentAnalysisStatus.NEEDS_REVIEW,
                         confidence=CommentAnalysisConfidence.NONE,
-                        summary=comment_raw[:200],
-                        parse_notes=f"schema_invalid:{exc}",
+                        summary=(parsed.summary or comment_raw[:200]),
+                        parse_notes=f"schema_invalid:{type(exc).__name__}",
                     )
                 done_ids.add(position_id)
                 continue
@@ -956,7 +1026,7 @@ async def run_claimed_enrichment(
                 session,
                 job_id=claim.job_id,
                 claim_token=claim.claim_token,
-                error=str(exc),
+                error=type(exc).__name__,
                 settings=settings,
                 now_utc=now_utc,
             )

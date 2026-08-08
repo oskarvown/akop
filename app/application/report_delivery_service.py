@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
 
@@ -30,6 +30,7 @@ from app.domain.models import (
     AuditCycleStatus,
     AuditReport,
     AuditReportStatus,
+    CommentEnrichmentJob,
     ReportDelivery,
     ReportDeliveryChannel,
     ReportDeliveryKind,
@@ -269,7 +270,11 @@ async def list_due_delivery_ids(
     now_utc: dt.datetime | None = None,
     limit: int | None = None,
 ) -> list[int]:
-    """Return PENDING and retryable FAILED delivery ids without claiming them."""
+    """Return PENDING and retryable FAILED delivery ids without claiming them.
+
+    Due filtering is applied in SQL before LIMIT so terminal/not-due rows cannot
+    starve newer ready deliveries (Stage 4.3 regression).
+    """
     now = _ensure_utc(now_utc or dt.datetime.now(dt.timezone.utc))
     max_attempts = int(settings.report_delivery_max_attempts)  # type: ignore[attr-defined]
     row_limit = int(settings.report_delivery_batch_size) if limit is None else limit
@@ -278,28 +283,25 @@ async def list_due_delivery_ids(
     async with session.begin():
         rows = (
             await session.execute(
-                select(ReportDelivery)
+                select(ReportDelivery.id)
                 .where(
-                    ReportDelivery.status.in_(
-                        (ReportDeliveryStatus.PENDING, ReportDeliveryStatus.FAILED)
+                    or_(
+                        ReportDelivery.status == ReportDeliveryStatus.PENDING,
+                        and_(
+                            ReportDelivery.status == ReportDeliveryStatus.FAILED,
+                            ReportDelivery.attempt_count < max_attempts,
+                            or_(
+                                ReportDelivery.next_retry_at.is_(None),
+                                ReportDelivery.next_retry_at <= now,
+                            ),
+                        ),
                     )
                 )
                 .order_by(ReportDelivery.id)
                 .limit(row_limit)
             )
         ).scalars().all()
-        return [
-            delivery.id
-            for delivery in rows
-            if delivery.status == ReportDeliveryStatus.PENDING
-            or (
-                delivery.attempt_count < max_attempts
-                and (
-                    delivery.next_retry_at is None
-                    or _ensure_utc(delivery.next_retry_at) <= now
-                )
-            )
-        ]
+        return list(rows)
 
 
 async def claim_delivery(
@@ -587,6 +589,7 @@ def format_report_summary_messages(
     *,
     kind_label: str = "CORE",
     start_index: int = 0,
+    enrichment_counts: Mapping[str, Any] | None = None,
 ) -> list[str]:
     """Format plain-text Telegram summaries, safely falling back for old JSON."""
     summary = summary_json or {}
@@ -596,18 +599,26 @@ def format_report_summary_messages(
         debt = metrics.get("total_debt")
         if isinstance(debt, Mapping):
             current = debt.get("current")
+            previous = debt.get("previous")
             delta = debt.get("abs_delta")
             lines.append(f"Текущий долг: {_money(current)}")
-            try:
-                delta_decimal = Decimal(str(delta)) if delta is not None else None
-            except (InvalidOperation, ValueError):
-                delta_decimal = None
-            if delta_decimal is None or delta_decimal == 0:
-                lines.append("Изменение долга: без изменений")
-            elif delta_decimal < 0:
-                lines.append(f"Изменение долга: чистое снижение долга на {_money(-delta_decimal)}")
+            if previous is None:
+                lines.append("Сравнение с предыдущим периодом: нет данных")
             else:
-                lines.append(f"Изменение долга: рост долга на {_money(delta_decimal)}")
+                try:
+                    delta_decimal = Decimal(str(delta)) if delta is not None else None
+                except (InvalidOperation, ValueError):
+                    delta_decimal = None
+                if delta_decimal is None or delta_decimal == 0:
+                    lines.append("Изменение долга: без изменений")
+                elif delta_decimal < 0:
+                    lines.append(
+                        f"Изменение долга: чистое снижение долга на {_money(-delta_decimal)}"
+                    )
+                else:
+                    lines.append(
+                        f"Изменение долга: рост долга на {_money(delta_decimal)}"
+                    )
         overdue = summary.get("total_overdue")
         if isinstance(overdue, Mapping):
             lines.append(f"Общая просрочка: {_money(overdue.get('current'))}")
@@ -623,6 +634,16 @@ def format_report_summary_messages(
     controls = summary.get("control_failures")
     if isinstance(controls, list) and controls:
         lines.append(f"Контрольные проверки с отклонениями: {len(controls)}")
+
+    if enrichment_counts is not None:
+        lines.append("Анализ комментариев:")
+        lines.append(f"Всего комментариев: {int(enrichment_counts.get('total', 0))}")
+        lines.append(f"resolved: {int(enrichment_counts.get('resolved', 0))}")
+        lines.append(f"needs_review: {int(enrichment_counts.get('needs_review', 0))}")
+        lines.append(
+            f"deterministic: {int(enrichment_counts.get('deterministic', 0))}"
+        )
+        lines.append(f"LLM: {int(enrichment_counts.get('llm', 0))}")
 
     messages = _split_text("\n".join(lines))
     return messages[start_index:]
@@ -696,6 +717,18 @@ async def load_delivery_send_context(
         )
         if cycle is None:
             return None
+        enrichment_counts: dict[str, Any] | None = None
+        if (
+            artifact.kind is AuditArtifactKind.ENRICHED
+            and artifact.enrichment_job_id is not None
+        ):
+            job = await session.scalar(
+                select(CommentEnrichmentJob).where(
+                    CommentEnrichmentJob.id == artifact.enrichment_job_id
+                )
+            )
+            if job is not None and isinstance(job.enrichment_counts_json, dict):
+                enrichment_counts = dict(job.enrichment_counts_json)
         return DeliverySendContext(
             delivery_id=delivery.id,
             document_message_id=delivery.document_message_id,
@@ -710,6 +743,7 @@ async def load_delivery_send_context(
                 report.summary_json,
                 kind_label=artifact.kind.value.upper(),
                 start_index=int(delivery.summary_sent_count),
+                enrichment_counts=enrichment_counts,
             ),
             caption=format_report_caption(
                 report_date=cycle.report_date,

@@ -72,6 +72,62 @@ def test_filename_and_caption_deterministic() -> None:
     assert "CORE" in caption
 
 
+def test_first_report_summary_has_no_prior_period_comparison() -> None:
+    """Stage 4.3: first report must not show growth/decline/unchanged."""
+    messages = format_report_summary_messages(
+        {
+            "company_metrics": {
+                "total_debt": {
+                    "current": "10",
+                    "previous": None,
+                    "abs_delta": "10",
+                    "percent_delta": None,
+                }
+            }
+        }
+    )
+    joined = "\n".join(messages)
+    assert "Сравнение с предыдущим периодом: нет данных" in joined
+    assert "Изменение долга: без изменений" not in joined
+    assert "рост" not in joined.lower()
+    assert "снижение" not in joined.lower()
+
+
+def test_enriched_summary_includes_immutable_enrichment_counts() -> None:
+    financial = {
+        "company_metrics": {
+            "total_debt": {
+                "current": "10",
+                "previous": "10",
+                "abs_delta": "0",
+                "percent_delta": "0",
+            }
+        }
+    }
+    core = "\n".join(format_report_summary_messages(financial, kind_label="CORE"))
+    assert "Анализ комментариев" not in core
+
+    enriched = "\n".join(
+        format_report_summary_messages(
+            financial,
+            kind_label="ENRICHED",
+            enrichment_counts={
+                "total": 4,
+                "resolved": 2,
+                "needs_review": 2,
+                "deterministic": 1,
+                "llm": 1,
+            },
+        )
+    )
+    assert "Анализ комментариев" in enriched
+    assert "Всего комментариев: 4" in enriched
+    assert "resolved: 2" in enriched
+    assert "needs_review: 2" in enriched
+    assert "deterministic: 1" in enriched
+    assert "LLM: 1" in enriched
+
+
 def test_summary_formatter_debt_wording_and_legacy() -> None:
     rich = {
         "company_metrics": {

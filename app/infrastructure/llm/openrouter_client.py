@@ -53,49 +53,90 @@ _SYSTEM = (
 )
 
 
-def _parse_facts(payload: dict[str, Any]) -> LlmCommentFacts:
-    required = {
-        "mentioned_date",
-        "mentioned_amount",
-        "action",
-        "reason",
-        "responsible_person",
-        "summary",
-        "confidence",
-    }
-    if not required.issubset(payload.keys()):
-        raise OpenRouterSchemaError("missing keys")
-    mentioned_date = None
-    raw_date = payload.get("mentioned_date")
-    if raw_date not in (None, ""):
-        mentioned_date = date.fromisoformat(str(raw_date))
-    mentioned_amount = None
-    raw_amount = payload.get("mentioned_amount")
-    if raw_amount not in (None, ""):
-        try:
-            mentioned_amount = Decimal(str(raw_amount))
-        except (InvalidOperation, ValueError) as exc:
-            raise OpenRouterSchemaError("invalid amount") from exc
-    confidence = str(payload.get("confidence") or "none")
-    if confidence not in {"high", "medium", "low", "none"}:
-        raise OpenRouterSchemaError("invalid confidence")
-    return LlmCommentFacts(
-        mentioned_date=mentioned_date,
-        mentioned_amount=mentioned_amount,
-        action=_opt_str(payload.get("action")),
-        reason=_opt_str(payload.get("reason")),
-        responsible_person=_opt_str(payload.get("responsible_person")),
-        summary=_opt_str(payload.get("summary")),
-        confidence=confidence,
-        raw_json=payload,
-    )
-
-
 def _opt_str(value: object) -> str | None:
     if value is None:
         return None
-    text = str(value).strip()
+    if not isinstance(value, str):
+        raise OpenRouterSchemaError("invalid string field")
+    text = value.strip()
     return text or None
+
+
+def _parse_facts(payload: dict[str, Any]) -> LlmCommentFacts:
+    """Normalize all payload validation failures to OpenRouterSchemaError."""
+    try:
+        if not isinstance(payload, dict):
+            raise OpenRouterSchemaError("content not object")
+        required = {
+            "mentioned_date",
+            "mentioned_amount",
+            "action",
+            "reason",
+            "responsible_person",
+            "summary",
+            "confidence",
+        }
+        if not required.issubset(payload.keys()):
+            raise OpenRouterSchemaError("missing keys")
+        mentioned_date = None
+        raw_date = payload.get("mentioned_date")
+        if raw_date not in (None, ""):
+            try:
+                mentioned_date = date.fromisoformat(str(raw_date))
+            except ValueError as exc:
+                raise OpenRouterSchemaError("invalid date") from exc
+        mentioned_amount = None
+        raw_amount = payload.get("mentioned_amount")
+        if raw_amount not in (None, ""):
+            try:
+                mentioned_amount = Decimal(str(raw_amount))
+            except (InvalidOperation, ValueError, TypeError) as exc:
+                raise OpenRouterSchemaError("invalid amount") from exc
+        confidence = payload.get("confidence")
+        if confidence is None:
+            confidence = "none"
+        if not isinstance(confidence, str):
+            raise OpenRouterSchemaError("invalid confidence")
+        confidence = confidence.strip() or "none"
+        if confidence not in {"high", "medium", "low", "none"}:
+            raise OpenRouterSchemaError("invalid confidence")
+        return LlmCommentFacts(
+            mentioned_date=mentioned_date,
+            mentioned_amount=mentioned_amount,
+            action=_opt_str(payload.get("action")),
+            reason=_opt_str(payload.get("reason")),
+            responsible_person=_opt_str(payload.get("responsible_person")),
+            summary=_opt_str(payload.get("summary")),
+            confidence=confidence,
+            raw_json=payload,
+        )
+    except OpenRouterSchemaError:
+        raise
+    except (TypeError, ValueError, AttributeError, KeyError) as exc:
+        raise OpenRouterSchemaError("invalid payload") from exc
+
+
+def _extract_message_content(data: Any) -> str:
+    try:
+        if not isinstance(data, dict):
+            raise OpenRouterSchemaError("response not object")
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise OpenRouterSchemaError("missing choices")
+        first = choices[0]
+        if not isinstance(first, dict):
+            raise OpenRouterSchemaError("invalid choices")
+        message = first.get("message")
+        if not isinstance(message, dict):
+            raise OpenRouterSchemaError("invalid message")
+        content = message.get("content")
+        if not isinstance(content, str) or not content.strip():
+            raise OpenRouterSchemaError("empty content")
+        return content
+    except OpenRouterSchemaError:
+        raise
+    except (TypeError, AttributeError, KeyError, IndexError) as exc:
+        raise OpenRouterSchemaError("invalid choices") from exc
 
 
 class OpenRouterClient:
@@ -123,6 +164,7 @@ class OpenRouterClient:
         report_date: date,
         counterparty_label: str | None,
     ) -> LlmCommentFacts:
+        # Caller must pass already-redacted comment/label; never log raw payload.
         body = {
             "model": self._model,
             "messages": [
@@ -149,39 +191,43 @@ class OpenRouterClient:
         last_error: Exception | None = None
         owns_session = self._session is None
         session = self._session or aiohttp.ClientSession()
+        attempts = max(1, int(self._max_retries) + 1)
         try:
-            for _ in range(max(1, self._max_retries + 1)):
+            for attempt in range(attempts):
                 try:
                     timeout = aiohttp.ClientTimeout(total=self._timeout)
                     async with session.post(
                         url, json=body, headers=headers, timeout=timeout
                     ) as resp:
                         if resp.status in {408, 429} or resp.status >= 500:
-                            text = await resp.text()
+                            await resp.read()
                             raise OpenRouterTransientError(
-                                f"openrouter_http_{resp.status}:{text[:200]}"
+                                f"openrouter_http_{resp.status}"
                             )
                         if resp.status >= 400:
-                            text = await resp.text()
+                            await resp.read()
                             raise OpenRouterSchemaError(
-                                f"openrouter_http_{resp.status}:{text[:200]}"
+                                f"openrouter_http_{resp.status}"
                             )
-                        data = await resp.json()
-                    content = (
-                        data.get("choices", [{}])[0]
-                        .get("message", {})
-                        .get("content")
-                    )
-                    if not content:
-                        raise OpenRouterSchemaError("empty content")
-                    payload = json.loads(content)
-                    if not isinstance(payload, dict):
-                        raise OpenRouterSchemaError("content not object")
+                        data = await resp.json(content_type=None)
+                    content = _extract_message_content(data)
+                    try:
+                        payload = json.loads(content)
+                    except json.JSONDecodeError as exc:
+                        raise OpenRouterSchemaError("invalid json") from exc
                     return _parse_facts(payload)
+                except OpenRouterSchemaError:
+                    raise
+                except OpenRouterTransientError as exc:
+                    last_error = exc
+                    if attempt + 1 >= attempts:
+                        raise
+                    continue
                 except (aiohttp.ClientError, TimeoutError, asyncio.TimeoutError) as exc:
-                    last_error = OpenRouterTransientError(str(exc))
-                except json.JSONDecodeError as exc:
-                    raise OpenRouterSchemaError("invalid json") from exc
+                    last_error = OpenRouterTransientError(type(exc).__name__)
+                    if attempt + 1 >= attempts:
+                        raise last_error from exc
+                    continue
             assert last_error is not None
             raise last_error
         finally:
