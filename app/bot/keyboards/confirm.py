@@ -2,6 +2,29 @@
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 
+def department_confirm_keyboard(upload_token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Подтвердить",
+                    callback_data=f"deptconfirm:{upload_token}:confirm",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Другой отдел",
+                    callback_data=f"deptconfirm:{upload_token}:other",
+                ),
+                InlineKeyboardButton(
+                    text="Отмена",
+                    callback_data=f"deptconfirm:{upload_token}:cancel",
+                ),
+            ],
+        ]
+    )
+
+
 def replacement_keyboard(upload_token: str) -> InlineKeyboardMarkup:
     return _confirmation_keyboard(
         confirm_text="Заменить",

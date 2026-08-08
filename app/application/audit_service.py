@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import NoReturn
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -15,6 +15,7 @@ from app.domain.enums import Department
 from app.domain.models import (
     AuditCycle,
     AuditCycleStatus,
+    DebtPosition,
     SourceFile,
     SourceFileLifecycle,
 )
@@ -46,6 +47,14 @@ class StaleReplacementError(AuditServiceError):
 
 
 class AuditCycleNotFoundError(AuditServiceError):
+    pass
+
+
+class SourceFileNotFoundError(AuditServiceError):
+    pass
+
+
+class WithdrawNotAllowedError(AuditServiceError):
     pass
 
 
@@ -90,6 +99,17 @@ class AddResult:
     summary: CycleStatusSummary
     source_file_id: int
     total_debt: Decimal | None
+    previous_source_file_id: int | None = None
+
+
+@dataclass(frozen=True)
+class WithdrawResult:
+    cycle_id: int
+    report_date: dt.date
+    department: Department
+    status: AuditCycleStatus
+    summary: CycleStatusSummary
+    restored_source_file_id: int | None
 
 
 @dataclass(frozen=True)
@@ -368,9 +388,97 @@ async def replace_source_file_atomic(
                 summary=summary,
                 source_file_id=source_file.id,
                 total_debt=_result_total_debt(result),
+                previous_source_file_id=expected_active_source_file_id,
             )
     except IntegrityError as exc:
         _raise_translated_integrity_error(exc)
+
+
+async def withdraw_source_file_atomic(
+    session: AsyncSession,
+    *,
+    source_file_id: int,
+    previous_source_file_id: int | None = None,
+) -> WithdrawResult:
+    """Remove a mistaken active upload so the same SHA can be assigned again.
+
+    Hard-deletes the active ``SourceFile`` and its ``DebtPosition`` rows. For a
+    prior replace, restores ``previous_source_file_id`` to ``ACTIVE``. If the
+    cycle was completed by this file, reopens it to ``collecting``.
+    """
+    async with session.begin():
+        source_file = await session.scalar(
+            select(SourceFile)
+            .where(SourceFile.id == source_file_id)
+            .with_for_update()
+        )
+        if source_file is None:
+            raise SourceFileNotFoundError(f"SourceFile {source_file_id} not found")
+        if source_file.lifecycle_status != SourceFileLifecycle.ACTIVE:
+            raise WithdrawNotAllowedError("only an active source file can be undone")
+        if source_file.audit_cycle_id is None:
+            raise WithdrawNotAllowedError("source file is not attached to a cycle")
+
+        cycle = await session.scalar(
+            select(AuditCycle)
+            .where(AuditCycle.id == source_file.audit_cycle_id)
+            .with_for_update()
+        )
+        if cycle is None:
+            raise AuditCycleNotFoundError("audit cycle missing for source file")
+        if cycle.status == AuditCycleStatus.EXPIRED:
+            raise WithdrawNotAllowedError("expired cycles cannot be undone")
+
+        department = source_file.department
+        restored_id: int | None = None
+        if previous_source_file_id is not None:
+            previous = await session.scalar(
+                select(SourceFile)
+                .where(SourceFile.id == previous_source_file_id)
+                .with_for_update()
+            )
+            if (
+                previous is None
+                or previous.audit_cycle_id != cycle.id
+                or previous.department != department
+                or previous.lifecycle_status != SourceFileLifecycle.SUPERSEDED
+            ):
+                raise WithdrawNotAllowedError(
+                    "previous superseded file is missing or incompatible"
+                )
+            restored_id = previous.id
+
+        await session.execute(
+            update(DebtPosition)
+            .where(DebtPosition.source_file_id == source_file.id)
+            .values(parent_position_id=None)
+        )
+        await session.execute(
+            delete(DebtPosition).where(DebtPosition.source_file_id == source_file.id)
+        )
+        await session.delete(source_file)
+        await session.flush()
+
+        if restored_id is not None:
+            previous = await session.get(SourceFile, restored_id)
+            assert previous is not None
+            previous.lifecycle_status = SourceFileLifecycle.ACTIVE
+
+        if cycle.status == AuditCycleStatus.COMPLETED:
+            cycle.status = AuditCycleStatus.COLLECTING
+            cycle.completed_at = None
+
+        cycle.last_activity_at = func.clock_timestamp()
+        await session.flush()
+        summary = await cycle_status_summary(session, cycle.id)
+        return WithdrawResult(
+            cycle_id=cycle.id,
+            report_date=cycle.report_date,
+            department=department,
+            status=cycle.status,
+            summary=summary,
+            restored_source_file_id=restored_id,
+        )
 
 
 async def list_cycle_statuses(session: AsyncSession) -> list[CycleStatusView]:

@@ -7,7 +7,8 @@ from aiogram.types import Message
 async def handle_start(message: Message) -> None:
     await message.answer(
         "Дебиторка-бот запущен.\n"
-        "Отправьте Excel-файл для недельного аудита или используйте /status."
+        "Отправьте Excel-файл для недельного аудита или используйте /status.\n"
+        "Если после сохранения выбран неверный отдел — /undo."
     )
 
 

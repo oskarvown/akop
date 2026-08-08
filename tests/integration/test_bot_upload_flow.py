@@ -17,9 +17,11 @@ from app.application.audit_service import (
 from app.bot.handlers.upload import (
     UploadStates,
     handle_department_callback,
+    handle_department_confirm_callback,
     handle_document,
     handle_new_cycle_callback,
     handle_replace_callback,
+    handle_undo,
 )
 from app.bot.handlers.status import handle_status
 from app.domain.enums import Department
@@ -112,6 +114,37 @@ async def receive_valid(
     return message
 
 
+async def choose_department(
+    session: AsyncSession,
+    state: FakeState,
+    department: Department = Department.REGIONAL,
+) -> FakeCallback:
+    token = state.data["upload_token"]
+    callback = FakeCallback(f"dept:{token}:{department.value}")
+    await handle_department_callback(callback, state, session)  # type: ignore[arg-type]
+    return callback
+
+
+async def confirm_department(
+    session: AsyncSession,
+    state: FakeState,
+) -> FakeCallback:
+    token = state.data["upload_token"]
+    callback = FakeCallback(f"deptconfirm:{token}:confirm")
+    await handle_department_confirm_callback(callback, state, session)  # type: ignore[arg-type]
+    return callback
+
+
+async def choose_and_confirm_department(
+    session: AsyncSession,
+    state: FakeState,
+    department: Department = Department.REGIONAL,
+) -> FakeCallback:
+    await choose_department(session, state, department)
+    assert state.state == UploadStates.confirming_department.state
+    return await confirm_department(session, state)
+
+
 async def seed_file(
     session: AsyncSession,
     result: ValidationResult,
@@ -156,16 +189,62 @@ async def test_department_selection_saves_new_file(
 ) -> None:
     state = FakeState()
     await receive_valid(stage3_session, state)
-    token = state.data["upload_token"]
-    callback = FakeCallback(f"dept:{token}:{Department.REGIONAL.value}")
-    await handle_department_callback(callback, state, stage3_session)  # type: ignore[arg-type]
+    choose = await choose_department(stage3_session, state)
+    assert "Назначить файл" in choose.message.answers[-1][0]
+    assert state.state == UploadStates.confirming_department.state
 
-    assert "1/5" in callback.message.answers[-1][0]
-    assert "долг" in callback.message.answers[-1][0]
-    assert callback.answer_count == 1
-    assert state.state is None
+    confirm = await confirm_department(stage3_session, state)
+    assert "1/5" in confirm.message.answers[-1][0]
+    assert "долг" in confirm.message.answers[-1][0]
+    assert "/undo" in confirm.message.answers[-1][0]
+    assert confirm.answer_count == 1
+    assert state.state == UploadStates.can_undo.state
     async with stage3_session.begin():
         assert await stage3_session.scalar(select(func.count(SourceFile.id))) == 1
+
+
+@pytest.mark.asyncio
+async def test_department_confirm_other_returns_to_department_buttons(
+    stage3_session: AsyncSession,
+) -> None:
+    state = FakeState()
+    await receive_valid(stage3_session, state)
+    token = state.data["upload_token"]
+    await choose_department(stage3_session, state, Department.MOSCOW)
+    other = FakeCallback(f"deptconfirm:{token}:other")
+    await handle_department_confirm_callback(other, state, stage3_session)  # type: ignore[arg-type]
+
+    assert "Выберите другой отдел" in other.message.answers[-1][0]
+    assert state.state == UploadStates.choosing_department.state
+    async with stage3_session.begin():
+        assert await stage3_session.scalar(select(func.count(SourceFile.id))) == 0
+
+
+@pytest.mark.asyncio
+async def test_undo_withdraws_wrong_department_and_allows_reassign(
+    stage3_session: AsyncSession,
+) -> None:
+    state = FakeState()
+    await receive_valid(stage3_session, state)
+    await choose_and_confirm_department(stage3_session, state, Department.MOSCOW)
+    assert state.state == UploadStates.can_undo.state
+    sha = state.data["sha256"]
+
+    undo_message = FakeMessage()
+    await handle_undo(undo_message, state, stage3_session)  # type: ignore[arg-type]
+
+    assert "Снял файл" in undo_message.answers[-1][0]
+    assert "Выберите правильный отдел" in undo_message.answers[-1][0]
+    assert state.state == UploadStates.choosing_department.state
+    async with stage3_session.begin():
+        assert await stage3_session.scalar(select(func.count(SourceFile.id))) == 0
+
+    await choose_and_confirm_department(stage3_session, state, Department.REGIONAL)
+    async with stage3_session.begin():
+        row = await stage3_session.scalar(select(SourceFile))
+        assert row is not None
+        assert row.department == Department.REGIONAL
+        assert row.sha256 == sha
 
 
 @pytest.mark.asyncio
@@ -216,14 +295,14 @@ async def test_confirmed_replacement_supersedes_old_file(
     await seed_file(stage3_session, valid_result, Department.REGIONAL, "old-handler")
     state = FakeState()
     await receive_valid(stage3_session, state)
-    token = state.data["upload_token"]
-    choose = FakeCallback(f"dept:{token}:{Department.REGIONAL.value}")
-    await handle_department_callback(choose, state, stage3_session)  # type: ignore[arg-type]
+    await choose_and_confirm_department(stage3_session, state, Department.REGIONAL)
     assert state.state == UploadStates.confirming_replace.state
+    token = state.data["upload_token"]
 
     confirm = FakeCallback(f"replace:{token}:confirm")
     await handle_replace_callback(confirm, state, stage3_session)  # type: ignore[arg-type]
     assert "1/5" in confirm.message.answers[-1][0]
+    assert state.state == UploadStates.can_undo.state
 
     async with stage3_session.begin():
         lifecycles = (
@@ -245,12 +324,8 @@ async def test_cancel_replacement_keeps_old_file_active(
     await seed_file(stage3_session, valid_result, Department.REGIONAL, "old-cancel")
     state = FakeState()
     await receive_valid(stage3_session, state)
+    await choose_and_confirm_department(stage3_session, state, Department.REGIONAL)
     token = state.data["upload_token"]
-    await handle_department_callback(  # type: ignore[arg-type]
-        FakeCallback(f"dept:{token}:{Department.REGIONAL.value}"),
-        state,
-        stage3_session,
-    )
     cancel = FakeCallback(f"replace:{token}:cancel")
     await handle_replace_callback(cancel, state, stage3_session)  # type: ignore[arg-type]
 
@@ -315,11 +390,13 @@ async def test_second_date_requires_confirmation_before_cycle_creation(
     token = state.data["upload_token"]
     choose = FakeCallback(f"dept:{token}:{Department.MOSCOW.value}")
     await handle_department_callback(choose, state, stage3_session)  # type: ignore[arg-type]
+    assert state.state == UploadStates.confirming_department.state
+    await confirm_department(stage3_session, state)
     assert state.state == UploadStates.confirming_new_cycle.state
     assert await find_audit_cycle_by_report_date(stage3_session, second_date) is None
 
-    confirm = FakeCallback(f"newcycle:{token}:confirm")
-    await handle_new_cycle_callback(confirm, state, stage3_session)  # type: ignore[arg-type]
+    new_cycle = FakeCallback(f"newcycle:{token}:confirm")
+    await handle_new_cycle_callback(new_cycle, state, stage3_session)  # type: ignore[arg-type]
     assert await find_audit_cycle_by_report_date(stage3_session, second_date) is not None
 
 
@@ -333,12 +410,8 @@ async def test_stale_replacement_confirmation_does_not_overwrite_new_active(
     )
     state = FakeState()
     await receive_valid(stage3_session, state)
+    await choose_and_confirm_department(stage3_session, state, Department.REGIONAL)
     token = state.data["upload_token"]
-    await handle_department_callback(  # type: ignore[arg-type]
-        FakeCallback(f"dept:{token}:{Department.REGIONAL.value}"),
-        state,
-        stage3_session,
-    )
 
     assert valid_result.parsed is not None
     await replace_source_file_atomic(
@@ -417,6 +490,7 @@ async def test_callback_token_rejected_after_state_cleared_like_bot_restart(
     restarted_state = FakeState()  # empty FSM after MemoryStorage restart
     for callback_data, handler in (
         (f"dept:{token}:{Department.REGIONAL.value}", handle_department_callback),
+        (f"deptconfirm:{token}:confirm", handle_department_confirm_callback),
         (f"newcycle:{token}:confirm", handle_new_cycle_callback),
         (f"replace:{token}:confirm", handle_replace_callback),
     ):
