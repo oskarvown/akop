@@ -41,6 +41,15 @@ def test_parse_report_args_strict() -> None:
             parse_report_args(bad)
 
 
+@pytest.mark.parametrize(
+    "args",
+    ("2026-02-30", "2026-13-01", "core 2026-02-30"),
+)
+def test_parse_report_args_rejects_impossible_dates(args: str) -> None:
+    with pytest.raises(ReportArgsError):
+        parse_report_args(args)
+
+
 def test_filename_and_caption_deterministic() -> None:
     assert (
         build_report_filename(
@@ -113,7 +122,10 @@ def test_summary_formatter_debt_wording_and_legacy() -> None:
         }
     )
     joined = "\n".join(baseline)
-    assert "рост долга" in joined or "Текущий долг" in joined
+    assert "Текущий долг" in joined
+    assert "Сравнение с предыдущим периодом: нет данных" in joined
+    assert "рост" not in joined.lower()
+    assert "снижение" not in joined.lower()
 
 
 def test_summary_messages_respect_telegram_limit() -> None:

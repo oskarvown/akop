@@ -1,6 +1,7 @@
 """Manual /report command — Telegram delivery of CORE (or latest ENRICHED)."""
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import hashlib
 import logging
@@ -40,6 +41,15 @@ class ReportArgsError(ValueError):
     pass
 
 
+def _parse_report_date(token: str) -> dt.date:
+    if not _DATE_RE.match(token):
+        raise ReportArgsError("invalid")
+    try:
+        return dt.date.fromisoformat(token)
+    except ValueError:
+        raise ReportArgsError("invalid") from None
+
+
 def parse_report_args(args: str | None) -> ReportCommandArgs:
     """Strict parser: empty | YYYY-MM-DD | core | core YYYY-MM-DD."""
     tokens = (args or "").split()
@@ -48,14 +58,14 @@ def parse_report_args(args: str | None) -> ReportCommandArgs:
     if tokens[0].lower() == "core":
         if len(tokens) == 1:
             return ReportCommandArgs(force_core=True, report_date=None)
-        if len(tokens) == 2 and _DATE_RE.match(tokens[1]):
+        if len(tokens) == 2:
             return ReportCommandArgs(
-                force_core=True, report_date=dt.date.fromisoformat(tokens[1])
+                force_core=True, report_date=_parse_report_date(tokens[1])
             )
         raise ReportArgsError("invalid")
-    if len(tokens) == 1 and _DATE_RE.match(tokens[0]):
+    if len(tokens) == 1:
         return ReportCommandArgs(
-            force_core=False, report_date=dt.date.fromisoformat(tokens[0])
+            force_core=False, report_date=_parse_report_date(tokens[0])
         )
     raise ReportArgsError("invalid")
 
@@ -141,48 +151,71 @@ async def handle_report(
         )
         return
 
+    send_timeout = float(settings.report_delivery_send_timeout_seconds)
     try:
-        for text in ctx.summary_messages:
-            sent = await bot.send_message(
+        async with asyncio.timeout(send_timeout):
+            for text in ctx.summary_messages:
+                sent = await bot.send_message(
+                    chat_id=claim.destination_chat_id,
+                    text=text,
+                    parse_mode=None,
+                )
+                ok = await record_summary_message_sent(
+                    session,
+                    delivery_id=delivery_id,
+                    claim_token=claim.claim_token,
+                    message_id=sent.message_id,
+                )
+                if not ok:
+                    await message.answer(
+                        "Отправка прервана (конфликт доставки). Повторите /report.",
+                        parse_mode=None,
+                    )
+                    return
+
+            doc = await bot.send_document(
                 chat_id=claim.destination_chat_id,
-                text=text,
+                document=BufferedInputFile(excel, filename=ctx.filename),
+                caption=ctx.caption,
                 parse_mode=None,
             )
-            ok = await record_summary_message_sent(
+            ok = await record_document_sent(
                 session,
                 delivery_id=delivery_id,
                 claim_token=claim.claim_token,
-                message_id=sent.message_id,
+                message_id=doc.message_id,
             )
             if not ok:
                 await message.answer(
-                    "Отправка прервана (конфликт доставки). Повторите /report.",
+                    "Документ отправлен, но фиксация доставки не удалась. "
+                    "При повторе документ может не отправиться повторно.",
                     parse_mode=None,
                 )
                 return
-
-        doc = await bot.send_document(
-            chat_id=claim.destination_chat_id,
-            document=BufferedInputFile(excel, filename=ctx.filename),
-            caption=ctx.caption,
-            parse_mode=None,
-        )
-        ok = await record_document_sent(
+            await complete_delivery(
+                session, delivery_id=delivery_id, claim_token=claim.claim_token
+            )
+    except TimeoutError as exc:
+        logger.warning("Manual /report delivery timed out after %ss", send_timeout)
+        await fail_delivery(
             session,
             delivery_id=delivery_id,
             claim_token=claim.claim_token,
-            message_id=doc.message_id,
+            error=str(exc) or "delivery_send_timeout",
+            settings=settings,
         )
-        if not ok:
+        max_attempts = settings.report_delivery_max_attempts
+        if claim.attempt_count >= max_attempts:
             await message.answer(
-                "Документ отправлен, но фиксация доставки не удалась. "
-                "При повторе документ может не отправиться повторно.",
+                "Не удалось отправить отчёт. Повторите /report позже.",
                 parse_mode=None,
             )
-            return
-        await complete_delivery(
-            session, delivery_id=delivery_id, claim_token=claim.claim_token
-        )
+        else:
+            await message.answer(
+                "Отправка не удалась; повтор будет выполнен автоматически.",
+                parse_mode=None,
+            )
+        return
     except Exception as exc:
         logger.exception("Manual /report delivery failed")
         await fail_delivery(

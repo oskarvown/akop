@@ -1,6 +1,7 @@
 """Stage 4.3 Telegram delivery + /report integration tests."""
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import hashlib
 import uuid
@@ -10,7 +11,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from aiogram.types import BufferedInputFile
+from aiogram.types import BufferedInputFile, Chat, Message, User
+from aiogram.filters.command import CommandObject
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -20,6 +22,7 @@ from app.application.report_delivery_service import (
     complete_delivery,
     create_manual_delivery,
     fail_delivery,
+    list_due_delivery_ids,
     record_document_sent,
     record_summary_message_sent,
     recover_missing_automatic_deliveries,
@@ -31,6 +34,7 @@ from app.application.report_service import (
     complete_report_build,
     run_claimed_build,
 )
+from app.bot.handlers.report import handle_report
 from app.bot.scheduler.report_scheduler import ReportScheduler
 from app.domain.enums import Department
 from app.domain.models import (
@@ -40,6 +44,7 @@ from app.domain.models import (
     AuditReport,
     AuditReportStatus,
     ReportDelivery,
+    ReportDeliveryChannel,
     ReportDeliveryKind,
     ReportDeliveryStatus,
 )
@@ -688,6 +693,155 @@ async def test_partial_summary_resume_skips_already_sent(
         assert delivery.summary_sent_count >= 1
         assert 501 in (delivery.summary_message_ids or [])
         assert delivery.document_message_id == 700
+
+
+@pytest.mark.asyncio
+async def test_list_due_delivery_ids_skips_terminal_and_not_due_before_limit(
+    stage3_session_maker: async_sessionmaker[AsyncSession],
+    valid_result: ValidationResult,
+) -> None:
+    batch_size = 10
+    max_attempts = 5
+    settings = _settings(
+        report_delivery_batch_size=batch_size,
+        report_delivery_max_attempts=max_attempts,
+    )
+    now = dt.datetime(2026, 10, 10, 12, 0, tzinfo=dt.timezone.utc)
+
+    async with stage3_session_maker() as session:
+        cycle_id = await complete_cycle(
+            session,
+            valid_result,
+            report_date=dt.date(2026, 10, 10),
+            sha_prefix="s43-due",
+        )
+        await session.commit()
+    _, artifact_id, _ = await build_ready_core(
+        stage3_session_maker, cycle_id=cycle_id
+    )
+
+    async with stage3_session_maker() as session:
+        auto = await session.scalar(
+            select(ReportDelivery).where(
+                ReportDelivery.audit_artifact_id == artifact_id,
+                ReportDelivery.kind == ReportDeliveryKind.AUTOMATIC,
+            )
+        )
+        assert auto is not None
+        auto.status = ReportDeliveryStatus.DELIVERED
+        auto.delivered_at = now
+        auto.document_message_id = 1
+        blocked_ids: list[int] = []
+        for index in range(batch_size):
+            terminal = index % 2 == 0
+            blocked = ReportDelivery(
+                audit_artifact_id=artifact_id,
+                channel=ReportDeliveryChannel.TELEGRAM,
+                kind=ReportDeliveryKind.MANUAL,
+                status=ReportDeliveryStatus.FAILED,
+                destination_chat_id=MANUAL_CHAT_ID,
+                requested_by_user_id=USER_ID,
+                attempt_count=max_attempts if terminal else 1,
+                next_retry_at=(
+                    None if terminal else now + dt.timedelta(hours=1)
+                ),
+            )
+            session.add(blocked)
+            await session.flush()
+            blocked_ids.append(blocked.id)
+        await session.commit()
+
+    async with stage3_session_maker() as session:
+        pending_id = await create_manual_delivery(
+            session,
+            artifact_id=artifact_id,
+            destination_chat_id=MANUAL_CHAT_ID,
+            requested_by_user_id=USER_ID,
+        )
+        due_failed = ReportDelivery(
+            audit_artifact_id=artifact_id,
+            channel=ReportDeliveryChannel.TELEGRAM,
+            kind=ReportDeliveryKind.MANUAL,
+            status=ReportDeliveryStatus.FAILED,
+            destination_chat_id=MANUAL_CHAT_ID,
+            requested_by_user_id=USER_ID,
+            attempt_count=1,
+            next_retry_at=now - dt.timedelta(minutes=1),
+        )
+        session.add(due_failed)
+        await session.flush()
+        due_failed_id = due_failed.id
+        await session.commit()
+
+    async with stage3_session_maker() as session:
+        due_ids = await list_due_delivery_ids(
+            session, settings=settings, now_utc=now
+        )
+
+    assert due_ids == [pending_id, due_failed_id]
+    assert pending_id > max(blocked_ids)
+    assert due_failed_id > max(blocked_ids)
+    assert not any(blocked_id in due_ids for blocked_id in blocked_ids)
+
+
+@pytest.mark.asyncio
+async def test_manual_report_send_timeout_fails_delivery_and_notifies_retry(
+    stage3_session_maker: async_sessionmaker[AsyncSession],
+    valid_result: ValidationResult,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with stage3_session_maker() as session:
+        cycle_id = await complete_cycle(
+            session,
+            valid_result,
+            report_date=dt.date(2026, 10, 11),
+            sha_prefix="s43-timeout",
+        )
+        await session.commit()
+    await build_ready_core(stage3_session_maker, cycle_id=cycle_id)
+
+    from app.config import get_settings
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "report_delivery_send_timeout_seconds", 0.05)
+
+    hang = asyncio.Event()
+
+    async def hang_send_message(**kwargs: object) -> object:
+        await hang.wait()
+        return SimpleNamespace(message_id=1)
+
+    bot = AsyncMock()
+    bot.send_message = hang_send_message
+    bot.send_document = AsyncMock()
+
+    chat = Chat(id=MANUAL_CHAT_ID, type="private")
+    user = User(id=USER_ID, is_bot=False, first_name="Test")
+    message = AsyncMock(spec=Message)
+    message.chat = chat
+    message.from_user = user
+    message.answer = AsyncMock()
+    command = CommandObject(command="report", args="")
+
+    async with stage3_session_maker() as session:
+        await handle_report(message, command, session, bot)
+
+    message.answer.assert_awaited()
+    reply = message.answer.await_args.args[0]
+    assert "автоматически" in reply.lower()
+
+    async with stage3_session_maker() as session:
+        delivery = await session.scalar(
+            select(ReportDelivery)
+            .where(
+                ReportDelivery.destination_chat_id == MANUAL_CHAT_ID,
+                ReportDelivery.kind == ReportDeliveryKind.MANUAL,
+            )
+            .order_by(ReportDelivery.id.desc())
+        )
+        assert delivery is not None
+        assert delivery.status == ReportDeliveryStatus.FAILED
+        assert delivery.attempt_count == 1
 
 
 @pytest.mark.asyncio
