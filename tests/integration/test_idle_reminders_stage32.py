@@ -450,6 +450,62 @@ async def test_expire_after_max_successful_reminders_and_grace(
 
 
 @pytest.mark.asyncio
+async def test_expired_cycle_visible_in_status_with_missing_departments(
+    stage3_session_maker: async_sessionmaker[AsyncSession],
+    valid_result: ValidationResult,
+) -> None:
+    """After automatic EXPIRED, /status still shows progress and missing depts."""
+    from app.bot.handlers.status import handle_status, split_status_messages
+    from app.bot.keyboards.department import DEPARTMENT_LABELS
+
+    settings = _settings(audit_max_reminders=2, audit_expire_grace_seconds=3600)
+    async with stage3_session_maker() as session:
+        add_result = await seed_collecting(session, valid_result, sha="status-exp")
+        cycle_id = add_result.cycle_id
+        await _set_cycle_clock(
+            session,
+            cycle_id,
+            reminder_count=2,
+            last_reminder_at=dt.datetime.now(UTC) - dt.timedelta(hours=2),
+            last_activity_at=dt.datetime.now(UTC) - dt.timedelta(days=3),
+            clear_claim=True,
+        )
+
+    async with stage3_session_maker() as session:
+        assert await expire_cycle_if_due(
+            session, cycle_id=cycle_id, settings=settings
+        )
+
+    class _Msg:
+        def __init__(self) -> None:
+            self.answers: list[tuple[str, object]] = []
+
+        async def answer(self, text: str, reply_markup: object = None) -> None:
+            self.answers.append((text, reply_markup))
+
+    async with stage3_session_maker() as session:
+        views = await list_cycle_statuses(session)
+        message = _Msg()
+        await handle_status(message, session)  # type: ignore[arg-type]
+
+    expired_views = [v for v in views if v.id == cycle_id]
+    assert len(expired_views) == 1
+    view = expired_views[0]
+    assert view.status == AuditCycleStatus.EXPIRED
+    assert len(view.summary.present) == 1
+    assert Department.REGIONAL in view.summary.present
+    assert Department.MOSCOW in view.summary.missing
+
+    text = "\n".join(part[0] for part in message.answers)
+    assert f"Просрочен {REPORT_DATE:%d.%m.%Y}" in text
+    assert "1/5" in text
+    assert DEPARTMENT_LABELS[Department.MOSCOW] in text
+    # Shared formatter path used by /status packing
+    packed = split_status_messages(views)
+    assert any("Просрочен" in block and "1/5" in block for block in packed)
+
+
+@pytest.mark.asyncio
 async def test_completed_and_expired_ignored_by_scheduler(
     stage3_session_maker: async_sessionmaker[AsyncSession],
 ) -> None:

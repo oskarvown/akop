@@ -511,7 +511,11 @@ async def withdraw_source_file_atomic(
 
 
 async def list_cycle_statuses(session: AsyncSession) -> list[CycleStatusView]:
-    """Read all collecting and the three newest completed cycles as DTOs."""
+    """Read all collecting cycles and the three newest terminal cycles.
+
+    Terminal = COMPLETED or EXPIRED (newest by report_date). Collecting cycles
+    are always included in full.
+    """
     async with session.begin():
         cycle_rows = (
             await session.execute(
@@ -526,17 +530,23 @@ async def list_cycle_statuses(session: AsyncSession) -> list[CycleStatusView]:
                         (
                             AuditCycleStatus.COLLECTING,
                             AuditCycleStatus.COMPLETED,
+                            AuditCycleStatus.EXPIRED,
                         )
                     )
                 )
                 .order_by(AuditCycle.report_date.desc())
             )
         ).all()
-        collecting = [row for row in cycle_rows if row.status == AuditCycleStatus.COLLECTING]
-        completed = [
-            row for row in cycle_rows if row.status == AuditCycleStatus.COMPLETED
+        collecting = [
+            row for row in cycle_rows if row.status == AuditCycleStatus.COLLECTING
+        ]
+        terminal = [
+            row
+            for row in cycle_rows
+            if row.status
+            in (AuditCycleStatus.COMPLETED, AuditCycleStatus.EXPIRED)
         ][:3]
-        selected = collecting + completed
+        selected = collecting + terminal
         if not selected:
             return []
 

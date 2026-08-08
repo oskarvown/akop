@@ -8,17 +8,17 @@ Does not import app.config / get_settings. Existing notification_chat_id rows
 are backfilled via a temporary server_default of 743971617, then the default
 is dropped so new cycles are filled only by the application.
 """
-from typing import Sequence, Union
+from collections.abc import Sequence
 
-from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
+from alembic import op
 
 revision: str = "c5e300000001"
-down_revision: Union[str, None] = "b4d200000001"
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+down_revision: str | None = "b4d200000001"
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 # Deterministic backfill for rows created before Stage 3.2 (Sasha's chat id).
 _LEGACY_NOTIFICATION_CHAT_ID = 743971617
