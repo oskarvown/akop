@@ -1,8 +1,6 @@
-"""Background report build + Telegram delivery scheduler (Stage 4.3).
+"""Background report build + enrichment + Telegram delivery (Stage 4.3–4.4).
 
-Telegram I/O runs only after claim transactions commit. Delivery is at-least-once:
-if document_message_id is already recorded, send_document is skipped and the
-lifecycle completes as DELIVERED.
+Tick order (locked): CORE build → CORE deliveries → enrichment → ENRICHED deliveries.
 """
 from __future__ import annotations
 
@@ -19,8 +17,17 @@ from aiogram.exceptions import (
     TelegramRetryAfter,
 )
 from aiogram.types import BufferedInputFile
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.application.comment_enrichment_service import (
+    claim_enrichment_job,
+    enqueue_enrichment_job,
+    list_due_enrichment_job_ids,
+    recover_missing_enrichment_jobs,
+    recover_stale_claimed_enrichment_jobs,
+    run_claimed_enrichment,
+)
 from app.application.report_delivery_service import (
     claim_delivery,
     complete_delivery,
@@ -42,6 +49,8 @@ from app.application.report_service import (
     run_claimed_build,
 )
 from app.config.settings import Settings
+from app.domain.models import AuditArtifact, AuditArtifactKind, ReportDelivery
+from app.infrastructure.llm.openrouter_client import CommentLlmClient
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +59,7 @@ SendDocumentFn = Callable[..., Awaitable[object]]
 
 
 class ReportScheduler:
-    """Poll: recover → build reports → deliver Telegram CORE/manual outbox."""
+    """Poll: CORE build/deliver → enrichment → ENRICHED deliver."""
 
     def __init__(
         self,
@@ -60,12 +69,14 @@ class ReportScheduler:
         settings: Settings,
         send_message: SendMessageFn | None = None,
         send_document: SendDocumentFn | None = None,
+        llm_client: CommentLlmClient | None = None,
     ) -> None:
         self._bot = bot
         self._session_maker = session_maker
         self._settings = settings
         self._send_message = send_message or bot.send_message
         self._send_document = send_document or bot.send_document
+        self._llm_client = llm_client
         self._task: asyncio.Task[None] | None = None
         self._stopped = asyncio.Event()
 
@@ -95,13 +106,13 @@ class ReportScheduler:
 
     async def run_once(self, *, now_utc: dt.datetime | None = None) -> None:
         now = now_utc or dt.datetime.now(dt.timezone.utc)
+        # 1) CORE builds
         async with self._session_maker() as session:
             await recover_missing_reports(session)
         async with self._session_maker() as session:
             await recover_stale_building_reports(
                 session, settings=self._settings, now_utc=now
             )
-
         buildable = await prepare_buildable_report_ids(
             self._session_maker, settings=self._settings, now_utc=now
         )
@@ -115,18 +126,10 @@ class ReportScheduler:
                     "Report build failed for report_id=%s; continuing", report_id
                 )
 
-        async with self._session_maker() as session:
-            await recover_missing_automatic_deliveries(session)
-        async with self._session_maker() as session:
-            await recover_stale_claimed_deliveries(
-                session, settings=self._settings, now_utc=now
-            )
-
-        async with self._session_maker() as session:
-            due = await list_due_delivery_ids(
-                session, settings=self._settings, now_utc=now
-            )
-        for delivery_id in due:
+        # 2) CORE deliveries (before enrichment / OpenRouter)
+        await self._recover_deliveries(now_utc=now)
+        core_ids, _enriched_ids = await self._split_due_deliveries(now_utc=now)
+        for delivery_id in core_ids:
             if self._stopped.is_set():
                 break
             try:
@@ -136,6 +139,80 @@ class ReportScheduler:
                     "Report delivery failed for delivery_id=%s; continuing",
                     delivery_id,
                 )
+
+        # 3) Enrichment jobs
+        async with self._session_maker() as session:
+            await recover_missing_enrichment_jobs(session, settings=self._settings)
+        async with self._session_maker() as session:
+            await recover_stale_claimed_enrichment_jobs(
+                session, settings=self._settings, now_utc=now
+            )
+        async with self._session_maker() as session:
+            due_jobs = await list_due_enrichment_job_ids(
+                session, settings=self._settings, now_utc=now
+            )
+        for job_id in due_jobs:
+            if self._stopped.is_set():
+                break
+            try:
+                await self._enrich_one(job_id, now_utc=now)
+            except Exception:
+                logger.exception(
+                    "Enrichment failed for job_id=%s; continuing", job_id
+                )
+
+        # 4) ENRICHED deliveries
+        await self._recover_deliveries(now_utc=now)
+        _core_ids, enriched_ids = await self._split_due_deliveries(now_utc=now)
+        for delivery_id in enriched_ids:
+            if self._stopped.is_set():
+                break
+            try:
+                await self._deliver_one(delivery_id, now_utc=now)
+            except Exception:
+                logger.exception(
+                    "Report delivery failed for delivery_id=%s; continuing",
+                    delivery_id,
+                )
+
+    async def _recover_deliveries(self, *, now_utc: dt.datetime) -> None:
+        async with self._session_maker() as session:
+            await recover_missing_automatic_deliveries(session)
+        async with self._session_maker() as session:
+            await recover_stale_claimed_deliveries(
+                session, settings=self._settings, now_utc=now_utc
+            )
+
+    async def _split_due_deliveries(
+        self, *, now_utc: dt.datetime
+    ) -> tuple[list[int], list[int]]:
+        async with self._session_maker() as session:
+            due = await list_due_delivery_ids(
+                session, settings=self._settings, now_utc=now_utc
+            )
+        if not due:
+            return [], []
+        core_ids: list[int] = []
+        enriched_ids: list[int] = []
+        async with self._session_maker() as session:
+            rows = (
+                await session.execute(
+                    select(ReportDelivery.id, AuditArtifact.kind)
+                    .join(
+                        AuditArtifact,
+                        AuditArtifact.id == ReportDelivery.audit_artifact_id,
+                    )
+                    .where(ReportDelivery.id.in_(due))
+                )
+            ).all()
+            kind_by_id = {int(r.id): r.kind for r in rows}
+        for delivery_id in due:
+            kind = kind_by_id.get(delivery_id)
+            if kind is AuditArtifactKind.ENRICHED:
+                enriched_ids.append(delivery_id)
+            else:
+                core_ids.append(delivery_id)
+        return core_ids, enriched_ids
 
     async def _run_loop(self) -> None:
         poll = self._settings.report_scheduler_poll_seconds
@@ -174,6 +251,19 @@ class ReportScheduler:
                     excel_bytes=result.excel_bytes,
                     excel_sha256=result.excel_sha256,
                 )
+            # After CORE commit — enqueue enrichment (failures must not roll back CORE)
+            try:
+                async with self._session_maker() as session:
+                    await enqueue_enrichment_job(
+                        session,
+                        report_id=claim.report_id,
+                        settings=self._settings,
+                    )
+            except Exception:
+                logger.exception(
+                    "Enrichment enqueue failed after CORE ready report_id=%s",
+                    claim.report_id,
+                )
         except Exception as exc:
             async with self._session_maker() as session:
                 await fail_report_build(
@@ -185,6 +275,24 @@ class ReportScheduler:
                     now_utc=now_utc,
                 )
             raise
+
+    async def _enrich_one(self, job_id: int, *, now_utc: dt.datetime) -> None:
+        async with self._session_maker() as session:
+            claim = await claim_enrichment_job(
+                session,
+                job_id=job_id,
+                settings=self._settings,
+                now_utc=now_utc,
+            )
+        if claim is None:
+            return
+        await run_claimed_enrichment(
+            self._session_maker,
+            claim=claim,
+            settings=self._settings,
+            llm_client=self._llm_client,
+            now_utc=now_utc,
+        )
 
     async def _deliver_one(self, delivery_id: int, *, now_utc: dt.datetime) -> None:
         async with self._session_maker() as session:

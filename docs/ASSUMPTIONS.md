@@ -85,7 +85,9 @@
 - `AUDIT_REMINDER_CLAIM_TTL_SECONDS` — TTL claim-lease (300);
 - `AUDIT_REMINDER_SEND_TIMEOUT_SECONDS` — timeout Telegram send, строго меньше claim TTL (30);
 - `AUDIT_REMINDER_ERROR_BACKOFF_SECONDS` — мин. пауза после ошибки Telegram перед повторным claim (900);
-- `LLM_API_KEY`, `LLM_MODEL` — для fallback-парсинга неоднозначных комментариев (Roadmap §6.1); провайдер не выбран.
+- `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL`, `OPENROUTER_MODEL`, `OPENROUTER_TIMEOUT_SECONDS`, `OPENROUTER_MAX_RETRIES` — Stage 4.4 OpenRouter для ambiguous comments (провайдер зафиксирован: OpenRouter);
+- `COMMENT_ENRICHMENT_*` / `COMMENT_*_VERSION` — claim/run timeouts, attempts, batch, parser/prompt/schema/redaction versions (Stage 4.4);
+- `LLM_API_KEY`, `LLM_MODEL` — legacy aliases, подставляются в OpenRouter key/model если `OPENROUTER_*` пусты.
 
 ### 4.1. Ограничения доставки напоминаний (Stage 3.2)
 

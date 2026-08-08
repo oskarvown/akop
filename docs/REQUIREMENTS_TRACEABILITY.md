@@ -103,7 +103,8 @@
 | Формулировка «чистое снижение долга», не «оплата» | `tests/unit/test_report_delivery.py` | `app/application/report_delivery_service.py` |
 | Telegram delivery CORE + `/report` (Stage 4.3) | `tests/integration/test_stage43_delivery.py`; `tests/unit/test_report_delivery.py` | `app/application/report_delivery_service.py`; `app/bot/scheduler/report_scheduler.py`; `app/bot/handlers/report.py` |
 | Один automatic lifecycle; unlimited manual; at-least-once | `tests/integration/test_stage43_delivery.py` | `app/domain/models/report_delivery.py` |
-| ENRICHED generation / OpenRouter | — (Stage 4.4, не реализовано) | — |
+| ENRICHED generation / OpenRouter comment analysis (Stage 4.4) | `tests/integration/test_stage44_enrichment.py`; `tests/unit/test_comment_enrichment.py` | `app/application/comment_enrichment_service.py`; `app/infrastructure/llm/openrouter_client.py`; `app/domain/calculations/comment_parser.py` |
+| Promise fulfillment / alerts | — (Stage 6, не реализовано) | — |
 
 ## Безопасность и эксплуатация (Roadmap §7 чек-лист, §8 тесты)
 

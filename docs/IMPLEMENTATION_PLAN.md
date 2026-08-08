@@ -19,7 +19,7 @@
 | 1 | Каркас приложения | **Выполнен и закрыт пользователем** | `app/`, `alembic/` (async, без доменных моделей), pydantic-settings, aiogram + allowlist (outer middleware, private-only), systemd unit, без Docker |
 | 2 | Excel-парсер и валидация | **Подтверждён и официально закрыт пользователем** | Парсер/валидатор/reconciliation/доменные модели/первая миграция реализованы по единому шаблону, применимому к любому отделу (не хардкодят `Department.REGIONAL`); проверены на 4 реальных + 5 обезличенных файлах и параметризованным тестом на всех отделах, включая добавленный 30.07.2026 «Фокин» (см. «Отчёт по Stage 2» и «Обновление состава отделов») |
 | 3 | Недельный цикл и пакетная загрузка | **Часть 1 + часть 2 реализованы** | Часть 1: Telegram-приём Excel, отделы, `AuditCycle`, add/replace/undo, SHA-дедуп, `/status`, FSM. Часть 2: idle reminders + `EXPIRED` по PostgreSQL-scheduler (`notification_chat_id`, claim-token, backoff); Redis/FSM recovery/reopen отложены |
-| 4 | Первый аудит | **4.1–4.3 реализованы** | 4.1: `AuditReport` queue + comparison; 4.2: CORE Excel + `AuditArtifact`; 4.3: Telegram delivery + `/report` (`ReportDelivery`, at-least-once). ENRICHED/OpenRouter — Stage 4.4 (не начат) |
+| 4 | Первый аудит | **4.1–4.4 реализованы** | 4.1: `AuditReport` + comparison; 4.2: CORE Excel; 4.3: Telegram delivery + `/report`; 4.4: comment enrichment + ENRICHED Excel + auto ENRICHED. Stage 6 (promise status/alerts) отдельно |
 | 5 | Сравнение недель | Не начат | Заблокирован до 2 полных комплектов (10 файлов); базовая логика matching/переноса истории уже определена и не требует дополнительных решений для старта |
 | 6 | Обещания и алерты | Не начат | — |
 | 7 | Безопасность и production | Не начат | Native deploy: venv + systemd + PostgreSQL (см. `docs/ASSUMPTIONS.md` §2.3) |
@@ -126,7 +126,7 @@ Roadmap §5/§8 предлагает Docker Compose; Stage 0 **явно заме
 
 ## Следующий этап
 
-Stage 0 ревизии 5 подтверждён. **Stage 1–2 закрыты.** **Stage 3, часть 1 и часть 2 (idle reminders / EXPIRED) реализованы.** **Stage 4.1–4.3 реализованы** (отчёты, CORE Excel, Telegram delivery + `/report`). Следующий логичный шаг — Stage 4.4 (ENRICHED / OpenRouter) по отдельной команде.
+Stage 0 ревизии 5 подтверждён. **Stage 1–2 закрыты.** **Stage 3, часть 1 и часть 2 (idle reminders / EXPIRED) реализованы.** **Stage 4.1–4.4 реализованы** (отчёты, CORE, Telegram delivery, ENRICHED/OpenRouter). Следующий логичный шаг — Stage 5 (сравнение недель) или Stage 6 (обещания/алерты) по отдельной команде.
 
 ## Отчёт по Stage 1 (каркас приложения)
 
@@ -390,3 +390,13 @@ fokin    — «Фокин»
 - `summary_json`: L1 company metrics (9 additive) + overdue/new/closed; формулировки «чистое снижение долга» / «рост долга» / «без изменений».
 - Миграция `f8a600000001` (revises `e7f500000001`). Settings `REPORT_DELIVERY_*` в `.env.example` (локальный `.env` не коммитится).
 - ENRICHED / OpenRouter / comment analysis — **вне scope Stage 4.3**.
+
+## Отчёт по Stage 4.4 — comment enrichment + ENRICHED (08.08.2026)
+
+- `CommentEnrichmentJob` 1:N к `AuditReport` (immutable batches); `CommentAnalysis` с `ON DELETE RESTRICT`.
+- Enrichment enqueue **после** commit CORE (не внутри `complete_report_build`); `recover_missing_enrichment_jobs` идемпотентен.
+- Scheduler: CORE build → CORE delivery → enrichment → ENRICHED delivery.
+- ENRICHED = immutable CORE r1 bytes + лист «Комментарии» из frozen snapshot + analyses.
+- Automatic ENRICHED только для revision=1; r2+ без нового auto; option A: artifact ↔ job FK only.
+- OpenRouter для ambiguous; terminal FAILED + `retry_terminal_enrichment` с новым attempt budget; progress immutable.
+- Миграция `g9b700000001`. Promise status / alerts — Stage 6.

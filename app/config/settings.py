@@ -105,7 +105,35 @@ class Settings(BaseSettings):
         ..., alias="REPORT_DELIVERY_BATCH_SIZE"
     )
 
-    # LLM fallback (Roadmap §6.1, провайдер не выбран — Stage 6)
+    # LLM / OpenRouter (Stage 4.4); legacy LLM_* accepted as aliases
+    openrouter_api_key: str | None = Field(None, alias="OPENROUTER_API_KEY")
+    openrouter_base_url: str = Field(
+        "https://openrouter.ai/api/v1", alias="OPENROUTER_BASE_URL"
+    )
+    openrouter_model: str | None = Field(None, alias="OPENROUTER_MODEL")
+    openrouter_timeout_seconds: int = Field(60, alias="OPENROUTER_TIMEOUT_SECONDS")
+    openrouter_max_retries: int = Field(2, alias="OPENROUTER_MAX_RETRIES")
+    comment_enrichment_claim_ttl_seconds: int = Field(
+        600, alias="COMMENT_ENRICHMENT_CLAIM_TTL_SECONDS"
+    )
+    comment_enrichment_run_timeout_seconds: int = Field(
+        300, alias="COMMENT_ENRICHMENT_RUN_TIMEOUT_SECONDS"
+    )
+    comment_enrichment_max_attempts: int = Field(
+        5, alias="COMMENT_ENRICHMENT_MAX_ATTEMPTS"
+    )
+    comment_enrichment_backoff_seconds: int = Field(
+        60, alias="COMMENT_ENRICHMENT_BACKOFF_SECONDS"
+    )
+    comment_enrichment_batch_size: int = Field(
+        10, alias="COMMENT_ENRICHMENT_BATCH_SIZE"
+    )
+    comment_parser_version: str = Field("1", alias="COMMENT_PARSER_VERSION")
+    comment_prompt_version: str = Field("1", alias="COMMENT_PROMPT_VERSION")
+    comment_schema_version_llm: str = Field("1", alias="COMMENT_SCHEMA_VERSION_LLM")
+    comment_redaction_version: str = Field("1", alias="COMMENT_REDACTION_VERSION")
+
+    # Legacy aliases (optional)
     llm_api_key: str | None = Field(None, alias="LLM_API_KEY")
     llm_model: str | None = Field(None, alias="LLM_MODEL")
 
@@ -133,6 +161,11 @@ class Settings(BaseSettings):
         "report_delivery_backoff_seconds",
         "report_delivery_max_file_bytes",
         "report_delivery_batch_size",
+        "openrouter_timeout_seconds",
+        "comment_enrichment_claim_ttl_seconds",
+        "comment_enrichment_run_timeout_seconds",
+        "comment_enrichment_backoff_seconds",
+        "comment_enrichment_batch_size",
         "max_upload_size_bytes",
     )
     @classmethod
@@ -145,11 +178,19 @@ class Settings(BaseSettings):
         "audit_max_reminders",
         "report_build_max_attempts",
         "report_delivery_max_attempts",
+        "comment_enrichment_max_attempts",
     )
     @classmethod
     def _max_reminders_at_least_one(cls, value: int) -> int:
         if value < 1:
             raise ValueError("value must be >= 1")
+        return value
+
+    @field_validator("openrouter_max_retries")
+    @classmethod
+    def _non_negative_retries(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("OPENROUTER_MAX_RETRIES must be >= 0")
         return value
 
     @field_validator("audit_expire_grace_seconds")
@@ -183,6 +224,19 @@ class Settings(BaseSettings):
             raise ValueError(
                 "REPORT_DELIVERY_SEND_TIMEOUT_SECONDS must be strictly less than "
                 "REPORT_DELIVERY_CLAIM_TTL_SECONDS"
+            )
+        if self.openrouter_timeout_seconds >= self.comment_enrichment_claim_ttl_seconds:
+            raise ValueError(
+                "OPENROUTER_TIMEOUT_SECONDS must be strictly less than "
+                "COMMENT_ENRICHMENT_CLAIM_TTL_SECONDS"
+            )
+        if (
+            self.comment_enrichment_run_timeout_seconds
+            >= self.comment_enrichment_claim_ttl_seconds
+        ):
+            raise ValueError(
+                "COMMENT_ENRICHMENT_RUN_TIMEOUT_SECONDS must be strictly less than "
+                "COMMENT_ENRICHMENT_CLAIM_TTL_SECONDS"
             )
         return self
 

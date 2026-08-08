@@ -8,6 +8,8 @@ from app.domain.models import (
     AuditArtifact,
     AuditCycle,
     AuditReport,
+    CommentAnalysis,
+    CommentEnrichmentJob,
     Counterparty,
     DebtPosition,
     ManagerGroup,
@@ -27,6 +29,8 @@ async def clean_stage3_tables(
     async with maker() as session:
         await session.execute(delete(ReportDelivery))
         await session.execute(delete(AuditArtifact))
+        await session.execute(delete(CommentAnalysis))
+        await session.execute(delete(CommentEnrichmentJob))
         await session.execute(delete(AuditReport))
         await session.execute(delete(DebtPosition))
         await session.execute(delete(SourceFile))

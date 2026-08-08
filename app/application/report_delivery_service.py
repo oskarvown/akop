@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
 
@@ -146,12 +146,16 @@ def _is_fenced(delivery: ReportDelivery, claim_token: uuid.UUID) -> bool:
 async def enqueue_automatic_delivery(
     session: AsyncSession, artifact: AuditArtifact
 ) -> ReportDelivery | None:
-    """Create the sole automatic Telegram lifecycle for a CORE artifact.
+    """Create the sole automatic Telegram lifecycle for CORE or ENRICHED r1.
 
-    This small helper intentionally joins the caller's transaction: CORE artifact
-    creation and its automatic outbox row can therefore be committed together.
+    ENRICHED revision > 1 must never enqueue automatic delivery.
+    This helper joins the caller's transaction.
     """
-    if artifact.kind != AuditArtifactKind.CORE:
+    if artifact.kind == AuditArtifactKind.CORE:
+        pass
+    elif artifact.kind == AuditArtifactKind.ENRICHED and int(artifact.revision) == 1:
+        pass
+    else:
         return None
 
     existing = await session.scalar(
@@ -189,13 +193,19 @@ async def enqueue_automatic_delivery(
 
 
 async def recover_missing_automatic_deliveries(session: AsyncSession) -> list[int]:
-    """Backfill automatic rows for all persisted CORE artifacts."""
+    """Backfill automatic rows for CORE and ENRICHED revision=1 artifacts."""
     created: list[int] = []
     async with session.begin():
         artifacts = (
             await session.execute(
                 select(AuditArtifact)
-                .where(AuditArtifact.kind == AuditArtifactKind.CORE)
+                .where(
+                    (AuditArtifact.kind == AuditArtifactKind.CORE)
+                    | (
+                        (AuditArtifact.kind == AuditArtifactKind.ENRICHED)
+                        & (AuditArtifact.revision == 1)
+                    )
+                )
                 .order_by(AuditArtifact.id)
                 .with_for_update(skip_locked=True)
             )
@@ -268,25 +278,28 @@ async def list_due_delivery_ids(
     async with session.begin():
         rows = (
             await session.execute(
-                select(ReportDelivery.id)
+                select(ReportDelivery)
                 .where(
-                    or_(
-                        ReportDelivery.status == ReportDeliveryStatus.PENDING,
-                        and_(
-                            ReportDelivery.status == ReportDeliveryStatus.FAILED,
-                            ReportDelivery.attempt_count < max_attempts,
-                            or_(
-                                ReportDelivery.next_retry_at.is_(None),
-                                ReportDelivery.next_retry_at <= now,
-                            ),
-                        ),
+                    ReportDelivery.status.in_(
+                        (ReportDeliveryStatus.PENDING, ReportDeliveryStatus.FAILED)
                     )
                 )
                 .order_by(ReportDelivery.id)
                 .limit(row_limit)
             )
         ).scalars().all()
-        return list(rows)
+        return [
+            delivery.id
+            for delivery in rows
+            if delivery.status == ReportDeliveryStatus.PENDING
+            or (
+                delivery.attempt_count < max_attempts
+                and (
+                    delivery.next_retry_at is None
+                    or _ensure_utc(delivery.next_retry_at) <= now
+                )
+            )
+        ]
 
 
 async def claim_delivery(
@@ -583,26 +596,18 @@ def format_report_summary_messages(
         debt = metrics.get("total_debt")
         if isinstance(debt, Mapping):
             current = debt.get("current")
-            previous = debt.get("previous")
             delta = debt.get("abs_delta")
             lines.append(f"Текущий долг: {_money(current)}")
-            if previous is None:
-                lines.append("Сравнение с предыдущим периодом: нет данных")
+            try:
+                delta_decimal = Decimal(str(delta)) if delta is not None else None
+            except (InvalidOperation, ValueError):
+                delta_decimal = None
+            if delta_decimal is None or delta_decimal == 0:
+                lines.append("Изменение долга: без изменений")
+            elif delta_decimal < 0:
+                lines.append(f"Изменение долга: чистое снижение долга на {_money(-delta_decimal)}")
             else:
-                try:
-                    delta_decimal = Decimal(str(delta)) if delta is not None else None
-                except (InvalidOperation, ValueError):
-                    delta_decimal = None
-                if delta_decimal is None or delta_decimal == 0:
-                    lines.append("Изменение долга: без изменений")
-                elif delta_decimal < 0:
-                    lines.append(
-                        f"Изменение долга: чистое снижение долга на {_money(-delta_decimal)}"
-                    )
-                else:
-                    lines.append(
-                        f"Изменение долга: рост долга на {_money(delta_decimal)}"
-                    )
+                lines.append(f"Изменение долга: рост долга на {_money(delta_decimal)}")
         overdue = summary.get("total_overdue")
         if isinstance(overdue, Mapping):
             lines.append(f"Общая просрочка: {_money(overdue.get('current'))}")

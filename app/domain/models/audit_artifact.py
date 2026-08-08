@@ -3,8 +3,6 @@ from __future__ import annotations
 
 import datetime as dt
 import enum
-import uuid
-from typing import TYPE_CHECKING
 
 from sqlalchemy import (
     CheckConstraint,
@@ -19,13 +17,9 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.infrastructure.database.base import Base
-
-if TYPE_CHECKING:
-    pass
 
 
 class AuditArtifactKind(str, enum.Enum):
@@ -47,11 +41,19 @@ class AuditArtifact(Base):
             "(kind <> 'core') OR (revision = 1)",
             name="ck_audit_artifact_core_revision_eq_1",
         ),
+        CheckConstraint(
+            "("
+            " (kind = 'enriched' AND enrichment_job_id IS NOT NULL)"
+            " OR "
+            " (kind = 'core' AND enrichment_job_id IS NULL)"
+            ")",
+            name="ck_audit_artifact_enrichment_job_kind",
+        ),
         Index(
-            "uq_audit_artifact_comment_analysis_batch_id",
-            "comment_analysis_batch_id",
+            "uq_audit_artifact_enrichment_job_id",
+            "enrichment_job_id",
             unique=True,
-            postgresql_where=text("comment_analysis_batch_id IS NOT NULL"),
+            postgresql_where=text("enrichment_job_id IS NOT NULL"),
         ),
     )
 
@@ -78,8 +80,8 @@ class AuditArtifact(Base):
     generator_version: Mapped[str] = mapped_column(Text, nullable=False)
     schema_version: Mapped[str] = mapped_column(Text, nullable=False)
 
-    comment_analysis_batch_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), nullable=True
+    enrichment_job_id: Mapped[int | None] = mapped_column(
+        ForeignKey("comment_enrichment_jobs.id"), nullable=True
     )
     model_name: Mapped[str | None] = mapped_column(Text, nullable=True)
     prompt_version: Mapped[str | None] = mapped_column(Text, nullable=True)
