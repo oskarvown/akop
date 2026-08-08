@@ -472,6 +472,13 @@ def _canonical_raw_llm_json(value: dict[str, Any] | None) -> Any:
     return json.loads(_stable_json(value))
 
 
+def _canonical_amount(value: Decimal | None) -> str | None:
+    """Stable money string so Decimal('1000') and Decimal('1000.00') compare equal."""
+    if value is None:
+        return None
+    return format(value.quantize(Decimal("0.01")), "f")
+
+
 def _analysis_payload_dict(row: CommentAnalysis) -> dict[str, Any]:
     return {
         "analysis_input_hash": row.analysis_input_hash,
@@ -480,9 +487,7 @@ def _analysis_payload_dict(row: CommentAnalysis) -> dict[str, Any]:
         "analysis_status": row.analysis_status.value,
         "confidence": row.confidence.value,
         "mentioned_date": row.mentioned_date.isoformat() if row.mentioned_date else None,
-        "mentioned_amount": str(row.mentioned_amount)
-        if row.mentioned_amount is not None
-        else None,
+        "mentioned_amount": _canonical_amount(row.mentioned_amount),
         "action": row.action,
         "reason": row.reason,
         "responsible_person": row.responsible_person,
@@ -534,9 +539,7 @@ async def record_comment_analysis(
             "analysis_status": analysis_status.value,
             "confidence": confidence.value,
             "mentioned_date": mentioned_date.isoformat() if mentioned_date else None,
-            "mentioned_amount": str(mentioned_amount)
-            if mentioned_amount is not None
-            else None,
+            "mentioned_amount": _canonical_amount(mentioned_amount),
             "action": action,
             "reason": reason,
             "responsible_person": responsible_person,

@@ -213,7 +213,7 @@ class OpenRouterClient:
                             )
                         try:
                             data = await resp.json(content_type=None)
-                        except json.JSONDecodeError as exc:
+                        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                             raise OpenRouterSchemaError("invalid response json") from exc
                     content = _extract_message_content(data)
                     try:

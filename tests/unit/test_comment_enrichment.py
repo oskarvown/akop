@@ -4,9 +4,12 @@ from __future__ import annotations
 import datetime as dt
 from decimal import Decimal
 
+from decimal import Decimal
+
 from app.application.comment_enrichment_service import (
     compute_analysis_input_hash,
     compute_enrichment_input_hash,
+    _canonical_amount,
 )
 from app.domain.calculations.comment_parser import (
     CommentParseOutcome,
@@ -103,3 +106,10 @@ def test_enrichment_hash_includes_report_date() -> None:
         versions=_VERSIONS,
     )
     assert h1 != h2
+
+
+def test_canonical_amount_equalizes_trailing_zeros() -> None:
+    assert _canonical_amount(Decimal("1000")) == _canonical_amount(Decimal("1000.00"))
+    assert _canonical_amount(Decimal("1000.1")) == _canonical_amount(Decimal("1000.10"))
+    assert _canonical_amount(None) is None
+    assert _canonical_amount(Decimal("1000")) != _canonical_amount(Decimal("1000.01"))

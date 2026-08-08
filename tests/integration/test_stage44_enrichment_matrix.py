@@ -1330,3 +1330,86 @@ async def test_record_analysis_raw_llm_json_idempotent_and_conflict(
             )
         )
         assert count == 1
+
+
+@pytest.mark.asyncio
+async def test_record_analysis_amount_scale_idempotent_after_pg_roundtrip(
+    stage3_session_maker: async_sessionmaker[AsyncSession],
+    valid_result: ValidationResult,
+) -> None:
+    """Decimal('1000') vs Numeric(18,2) '1000.00' must not conflict on replay."""
+    from decimal import Decimal
+
+    async with stage3_session_maker() as session:
+        cycle_id = await complete_cycle(
+            session,
+            valid_result,
+            report_date=dt.date(2026, 12, 23),
+            sha_prefix="s44c-amt",
+        )
+        await session.commit()
+    report_id, _, _ = await build_ready_core(stage3_session_maker, cycle_id=cycle_id)
+    settings = _settings()
+    await _set_only_comment(stage3_session_maker, comment="Оплата 23.12 на 1000")
+    async with stage3_session_maker() as session:
+        job_id = await enqueue_enrichment_job(
+            session, report_id=report_id, settings=settings
+        )
+    async with stage3_session_maker() as session:
+        claim = await claim_enrichment_job(
+            session, job_id=job_id, settings=settings
+        )
+    assert claim is not None
+    async with stage3_session_maker() as session:
+        pos = await session.scalar(select(DebtPosition).limit(1))
+        assert pos is not None
+        position_id = int(pos.id)
+
+    async with stage3_session_maker() as session:
+        ok = await record_comment_analysis(
+            session,
+            job_id=job_id,
+            claim_token=claim.claim_token,
+            debt_position_id=position_id,
+            analysis_input_hash="h-amt",
+            comment_raw="Оплата 23.12 на 1000",
+            source=CommentAnalysisSource.DETERMINISTIC,
+            analysis_status=CommentAnalysisStatus.RESOLVED,
+            confidence=CommentAnalysisConfidence.HIGH,
+            mentioned_amount=Decimal("1000"),
+            summary="оплата",
+        )
+        assert ok is True
+
+    async with stage3_session_maker() as session:
+        # Replay with trailing zeros / alternate Decimal literal after PG readback.
+        ok2 = await record_comment_analysis(
+            session,
+            job_id=job_id,
+            claim_token=claim.claim_token,
+            debt_position_id=position_id,
+            analysis_input_hash="h-amt",
+            comment_raw="Оплата 23.12 на 1000",
+            source=CommentAnalysisSource.DETERMINISTIC,
+            analysis_status=CommentAnalysisStatus.RESOLVED,
+            confidence=CommentAnalysisConfidence.HIGH,
+            mentioned_amount=Decimal("1000.00"),
+            summary="оплата",
+        )
+        assert ok2 is True
+
+    async with stage3_session_maker() as session:
+        with pytest.raises(EnrichmentConflictError):
+            await record_comment_analysis(
+                session,
+                job_id=job_id,
+                claim_token=claim.claim_token,
+                debt_position_id=position_id,
+                analysis_input_hash="h-amt",
+                comment_raw="Оплата 23.12 на 1000",
+                source=CommentAnalysisSource.DETERMINISTIC,
+                analysis_status=CommentAnalysisStatus.RESOLVED,
+                confidence=CommentAnalysisConfidence.HIGH,
+                mentioned_amount=Decimal("1000.01"),
+                summary="оплата",
+            )
