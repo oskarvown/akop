@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import NoReturn
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -15,7 +15,6 @@ from app.domain.enums import Department
 from app.domain.models import (
     AuditCycle,
     AuditCycleStatus,
-    DebtPosition,
     SourceFile,
     SourceFileLifecycle,
 )
@@ -125,7 +124,7 @@ class CycleStatusView:
 async def find_source_file_by_sha256(
     session: AsyncSession, sha256: str
 ) -> SourceFileLookup | None:
-    """Return a projection DTO and finish the read-only transaction."""
+    """Return a blocking (ACTIVE/SUPERSEDED) SHA match; ignore REVOKED rows."""
     async with session.begin():
         row = (
             await session.execute(
@@ -135,7 +134,15 @@ async def find_source_file_by_sha256(
                     SourceFile.department,
                     SourceFile.lifecycle_status,
                     SourceFile.audit_cycle_id,
-                ).where(SourceFile.sha256 == sha256)
+                ).where(
+                    SourceFile.sha256 == sha256,
+                    SourceFile.lifecycle_status.in_(
+                        (
+                            SourceFileLifecycle.ACTIVE,
+                            SourceFileLifecycle.SUPERSEDED,
+                        )
+                    ),
+                )
             )
         ).one_or_none()
         if row is None:
@@ -400,13 +407,38 @@ async def withdraw_source_file_atomic(
     source_file_id: int,
     previous_source_file_id: int | None = None,
 ) -> WithdrawResult:
-    """Remove a mistaken active upload so the same SHA can be assigned again.
+    """Soft-revoke a mistaken ACTIVE upload (never hard-delete rows).
 
-    Hard-deletes the active ``SourceFile`` and its ``DebtPosition`` rows. For a
-    prior replace, restores ``previous_source_file_id`` to ``ACTIVE``. If the
-    cycle was completed by this file, reopens it to ``collecting``.
+    Lock order is always ``AuditCycle FOR UPDATE`` then ``SourceFile FOR UPDATE``.
+    COMPLETED/EXPIRED cycles are immutable — undo is refused, cycle is not reopened.
+    On undo of a replace: current ACTIVE → REVOKED, previous SUPERSEDED → ACTIVE.
     """
     async with session.begin():
+        probe = (
+            await session.execute(
+                select(
+                    SourceFile.audit_cycle_id,
+                    SourceFile.lifecycle_status,
+                ).where(SourceFile.id == source_file_id)
+            )
+        ).one_or_none()
+        if probe is None:
+            raise SourceFileNotFoundError(f"SourceFile {source_file_id} not found")
+        if probe.lifecycle_status != SourceFileLifecycle.ACTIVE:
+            raise WithdrawNotAllowedError("only an active source file can be undone")
+        if probe.audit_cycle_id is None:
+            raise WithdrawNotAllowedError("source file is not attached to a cycle")
+
+        cycle = await session.scalar(
+            select(AuditCycle)
+            .where(AuditCycle.id == probe.audit_cycle_id)
+            .with_for_update()
+        )
+        if cycle is None:
+            raise AuditCycleNotFoundError("audit cycle missing for source file")
+        # COMPLETED / EXPIRED (and any non-collecting) — refuse, never reopen.
+        assert_cycle_mutable(cycle)
+
         source_file = await session.scalar(
             select(SourceFile)
             .where(SourceFile.id == source_file_id)
@@ -416,21 +448,12 @@ async def withdraw_source_file_atomic(
             raise SourceFileNotFoundError(f"SourceFile {source_file_id} not found")
         if source_file.lifecycle_status != SourceFileLifecycle.ACTIVE:
             raise WithdrawNotAllowedError("only an active source file can be undone")
-        if source_file.audit_cycle_id is None:
-            raise WithdrawNotAllowedError("source file is not attached to a cycle")
-
-        cycle = await session.scalar(
-            select(AuditCycle)
-            .where(AuditCycle.id == source_file.audit_cycle_id)
-            .with_for_update()
-        )
-        if cycle is None:
-            raise AuditCycleNotFoundError("audit cycle missing for source file")
-        if cycle.status == AuditCycleStatus.EXPIRED:
-            raise WithdrawNotAllowedError("expired cycles cannot be undone")
+        if source_file.audit_cycle_id != cycle.id:
+            raise WithdrawNotAllowedError("source file cycle mismatch after lock")
 
         department = source_file.department
         restored_id: int | None = None
+        previous: SourceFile | None = None
         if previous_source_file_id is not None:
             previous = await session.scalar(
                 select(SourceFile)
@@ -448,25 +471,11 @@ async def withdraw_source_file_atomic(
                 )
             restored_id = previous.id
 
-        await session.execute(
-            update(DebtPosition)
-            .where(DebtPosition.source_file_id == source_file.id)
-            .values(parent_position_id=None)
-        )
-        await session.execute(
-            delete(DebtPosition).where(DebtPosition.source_file_id == source_file.id)
-        )
-        await session.delete(source_file)
+        # Free the ACTIVE slot first, then restore previous if any.
+        source_file.lifecycle_status = SourceFileLifecycle.REVOKED
         await session.flush()
-
-        if restored_id is not None:
-            previous = await session.get(SourceFile, restored_id)
-            assert previous is not None
+        if previous is not None:
             previous.lifecycle_status = SourceFileLifecycle.ACTIVE
-
-        if cycle.status == AuditCycleStatus.COMPLETED:
-            cycle.status = AuditCycleStatus.COLLECTING
-            cycle.completed_at = None
 
         cycle.last_activity_at = func.clock_timestamp()
         await session.flush()
@@ -529,7 +538,7 @@ async def list_cycle_statuses(session: AsyncSession) -> list[CycleStatusView]:
             cycle_id: set() for cycle_id in cycle_ids
         }
         debt_by_cycle: dict[int, Decimal] = {
-            cycle_id: Decimal("0") for cycle_id in cycle_ids
+            cycle_id: Decimal(0) for cycle_id in cycle_ids
         }
         for file_row in file_rows:
             if file_row.audit_cycle_id is None:
@@ -558,7 +567,15 @@ async def list_cycle_statuses(session: AsyncSession) -> list[CycleStatusView]:
 
 async def _assert_sha256_available(session: AsyncSession, sha256: str) -> None:
     existing_id = await session.scalar(
-        select(SourceFile.id).where(SourceFile.sha256 == sha256)
+        select(SourceFile.id).where(
+            SourceFile.sha256 == sha256,
+            SourceFile.lifecycle_status.in_(
+                (
+                    SourceFileLifecycle.ACTIVE,
+                    SourceFileLifecycle.SUPERSEDED,
+                )
+            ),
+        )
     )
     if existing_id is not None:
         raise DuplicateSourceFileError("source file with this sha256 already exists")
@@ -594,8 +611,8 @@ def _extract_constraint_name(exc: IntegrityError) -> str | None:
             return str(name)
 
     match = re.search(
-        r"(uq_audit_cycle_report_date|uq_source_file_sha256|"
-        r"uq_source_file_active_per_department)",
+        r"(uq_audit_cycle_report_date|uq_source_file_sha256_active_or_superseded|"
+        r"uq_source_file_sha256|uq_source_file_active_per_department)",
         str(exc.orig),
     )
     return match.group(1) if match else None
@@ -603,7 +620,10 @@ def _extract_constraint_name(exc: IntegrityError) -> str | None:
 
 def _raise_translated_integrity_error(exc: IntegrityError) -> NoReturn:
     constraint_name = _extract_constraint_name(exc)
-    if constraint_name == "uq_source_file_sha256":
+    if constraint_name in {
+        "uq_source_file_sha256",
+        "uq_source_file_sha256_active_or_superseded",
+    }:
         raise DuplicateSourceFileError() from exc
     if constraint_name == "uq_source_file_active_per_department":
         raise DepartmentSlotTakenError() from exc

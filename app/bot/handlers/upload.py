@@ -35,13 +35,18 @@ from app.bot.keyboards.confirm import (
     department_confirm_keyboard,
     new_cycle_keyboard,
     replacement_keyboard,
+    undo_confirm_keyboard,
+    undo_offer_keyboard,
 )
 from app.bot.keyboards.department import DEPARTMENT_LABELS, department_keyboard
 from app.config import get_settings
 from app.domain.enums import Department
 from app.domain.models import AuditCycleStatus, SourceFileLifecycle
 from app.infrastructure.excel.checksum import compute_sha256
-from app.infrastructure.excel.validator import ValidationResult, validate_confirmed_template_file
+from app.infrastructure.excel.validator import (
+    ValidationResult,
+    validate_confirmed_template_file,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +57,7 @@ class UploadStates(StatesGroup):
     confirming_new_cycle = State()
     confirming_replace = State()
     can_undo = State()
+    confirming_undo = State()
 
 
 async def handle_cancel(message: Message, state: FSMContext) -> None:
@@ -59,65 +65,19 @@ async def handle_cancel(message: Message, state: FSMContext) -> None:
     await message.answer("Загрузка отменена.")
 
 
-async def handle_undo(message: Message, state: FSMContext, session: AsyncSession) -> None:
-    if await state.get_state() != UploadStates.can_undo.state:
+async def handle_undo(message: Message, state: FSMContext) -> None:
+    """Open undo confirmation; never executes withdraw immediately."""
+    current = await state.get_state()
+    if current not in {
+        UploadStates.can_undo.state,
+        UploadStates.confirming_undo.state,
+    }:
         await message.answer(
-            "Сейчас нечего отменять. /undo доступен сразу после сохранения файла "
-            "с неверным отделом (до следующей загрузки или /cancel)."
+            "Сейчас нечего отменять. Отмена доступна сразу после сохранения "
+            "файла в открытый сбор (до следующей загрузки или /cancel)."
         )
         return
-
-    data = await state.get_data()
-    source_file_id = data.get("undo_source_file_id")
-    if not isinstance(source_file_id, int):
-        await state.clear()
-        await message.answer("Данные для отмены устарели. Загрузите файл снова.")
-        return
-
-    previous_id = data.get("undo_previous_source_file_id")
-    previous_source_file_id = previous_id if isinstance(previous_id, int) else None
-
-    try:
-        withdraw = await withdraw_source_file_atomic(
-            session,
-            source_file_id=source_file_id,
-            previous_source_file_id=previous_source_file_id,
-        )
-    except (
-        SourceFileNotFoundError,
-        WithdrawNotAllowedError,
-        AuditCycleNotFoundError,
-    ) as exc:
-        await state.clear()
-        await message.answer(_withdraw_error_message(exc))
-        return
-    except Exception:
-        logger.exception("Ошибка /undo")
-        await state.clear()
-        await message.answer("Не удалось отменить назначение. Проверьте /status.")
-        return
-
-    upload_token = uuid4().hex[:12]
-    await state.set_state(UploadStates.choosing_department)
-    await state.set_data(
-        {
-            "upload_token": upload_token,
-            "result": data["result"],
-            "sha256": data["sha256"],
-            "original_filename": data["original_filename"],
-            "report_date": data["report_date"],
-        }
-    )
-    restored_note = ""
-    if withdraw.restored_source_file_id is not None:
-        restored_note = " Предыдущий файл отдела восстановлен."
-    await message.answer(
-        f"Снял файл с отдела {DEPARTMENT_LABELS[withdraw.department]} "
-        f"(аудит {withdraw.report_date:%d.%m.%Y}, "
-        f"сейчас {len(withdraw.summary.present)}/5).{restored_note}\n"
-        "Выберите правильный отдел:",
-        reply_markup=department_keyboard(upload_token),
-    )
+    await _prompt_undo_confirmation(message, state)
 
 
 async def handle_document(
@@ -263,11 +223,17 @@ async def handle_department_callback(
         await state.update_data(department=department.value)
         await state.set_state(UploadStates.confirming_department)
         filename = escape(str(data.get("original_filename", "файл")))
+        result = data.get("result")
+        debt = "не указан"
+        if isinstance(result, ValidationResult) and result.parsed is not None:
+            total = result.parsed.grand_total.total_debt
+            if total is not None:
+                debt = f"{total:,.2f}"
         await _callback_message(
             callback,
             f"Назначить файл «{filename}» отделу "
             f"{DEPARTMENT_LABELS[department]} "
-            f"(дата отчёта {report_date:%d.%m.%Y})?",
+            f"(дата отчёта {report_date:%d.%m.%Y}, долг: {debt})?",
             reply_markup=department_confirm_keyboard(token),
         )
     except Exception:
@@ -453,8 +419,10 @@ async def handle_replace_callback(
             await _callback_message(callback, _business_error_message(exc))
             return
 
-        await _arm_undo(state, data, add_result)
-        await _callback_message(callback, _success_message(add_result))
+        reply_markup = await _finalize_save(state, data, add_result)
+        await _callback_message(
+            callback, _success_message(add_result), reply_markup=reply_markup
+        )
     except Exception:
         logger.exception("Ошибка подтверждения замены файла")
         await state.clear()
@@ -463,6 +431,146 @@ async def handle_replace_callback(
         )
     finally:
         await callback.answer()
+
+
+async def handle_undo_offer_callback(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    try:
+        if await state.get_state() != UploadStates.can_undo.state:
+            await _callback_message(callback, "Эта кнопка устарела.")
+            return
+        parts = (callback.data or "").split(":")
+        if len(parts) != 3:
+            await _callback_message(callback, "Некорректная кнопка.")
+            return
+        _, token, action = parts
+        data = await state.get_data()
+        if data.get("undo_token") != token:
+            await _callback_message(callback, "Эта кнопка устарела.")
+            return
+        if action != "start":
+            await _callback_message(callback, "Некорректное действие.")
+            return
+        await _prompt_undo_confirmation(callback.message, state)  # type: ignore[arg-type]
+    except Exception:
+        logger.exception("Ошибка предложения отмены")
+        await state.clear()
+        await _callback_message(
+            callback, "Произошла ошибка. Проверьте /status."
+        )
+    finally:
+        await callback.answer()
+
+
+async def handle_undo_confirm_callback(
+    callback: CallbackQuery,
+    state: FSMContext,
+    session: AsyncSession,
+) -> None:
+    try:
+        if await state.get_state() != UploadStates.confirming_undo.state:
+            await _callback_message(callback, "Эта кнопка устарела.")
+            return
+        parts = (callback.data or "").split(":")
+        if len(parts) != 3:
+            await _callback_message(callback, "Некорректная кнопка.")
+            return
+        _, token, action = parts
+        data = await state.get_data()
+        if data.get("undo_token") != token:
+            await _callback_message(callback, "Эта кнопка устарела.")
+            return
+
+        if action == "keep":
+            # Stay undo-capable with a fresh token so repeated old buttons fail.
+            undo_token = uuid4().hex[:12]
+            await state.set_state(UploadStates.can_undo)
+            await state.update_data(undo_token=undo_token)
+            await _callback_message(
+                callback,
+                "Файл оставлен без изменений.",
+                reply_markup=undo_offer_keyboard(undo_token),
+            )
+            return
+        if action != "confirm":
+            await _callback_message(callback, "Некорректное действие.")
+            return
+
+        source_file_id = data.get("undo_source_file_id")
+        if not isinstance(source_file_id, int):
+            await state.clear()
+            await _callback_message(
+                callback, "Данные для отмены устарели. Загрузите файл снова."
+            )
+            return
+        previous_id = data.get("undo_previous_source_file_id")
+        previous_source_file_id = previous_id if isinstance(previous_id, int) else None
+
+        try:
+            withdraw = await withdraw_source_file_atomic(
+                session,
+                source_file_id=source_file_id,
+                previous_source_file_id=previous_source_file_id,
+            )
+        except (
+            SourceFileNotFoundError,
+            WithdrawNotAllowedError,
+            CycleImmutableError,
+            AuditCycleNotFoundError,
+        ) as exc:
+            await state.clear()
+            await _callback_message(callback, _withdraw_error_message(exc))
+            return
+
+        upload_token = uuid4().hex[:12]
+        await state.set_state(UploadStates.choosing_department)
+        await state.set_data(
+            {
+                "upload_token": upload_token,
+                "result": data["result"],
+                "sha256": data["sha256"],
+                "original_filename": data["original_filename"],
+                "report_date": data["report_date"],
+            }
+        )
+        restored_note = ""
+        if withdraw.restored_source_file_id is not None:
+            restored_note = " Предыдущий файл отдела восстановлен."
+        await _callback_message(
+            callback,
+            f"Снял файл с отдела {DEPARTMENT_LABELS[withdraw.department]} "
+            f"(аудит {withdraw.report_date:%d.%m.%Y}, "
+            f"сейчас {len(withdraw.summary.present)}/5).{restored_note}\n"
+            "Выберите правильный отдел:",
+            reply_markup=department_keyboard(upload_token),
+        )
+    except Exception:
+        logger.exception("Ошибка подтверждения отмены")
+        await state.clear()
+        await _callback_message(
+            callback, "Не удалось отменить назначение. Проверьте /status."
+        )
+    finally:
+        await callback.answer()
+
+
+async def _prompt_undo_confirmation(
+    target: Message | None,
+    state: FSMContext,
+) -> None:
+    if target is None:
+        return
+    data = await state.get_data()
+    undo_token = uuid4().hex[:12]
+    await state.set_state(UploadStates.confirming_undo)
+    await state.update_data(undo_token=undo_token)
+    await target.answer(
+        "Отменить последнюю загрузку? Файл останется в истории как отозванный, "
+        "слот отдела освободится.",
+        reply_markup=undo_confirm_keyboard(undo_token),
+    )
 
 
 async def _save_or_prompt_replacement(
@@ -523,15 +631,23 @@ async def _persist_add(
         await _callback_message(callback, _business_error_message(exc))
         return
 
-    await _arm_undo(state, data, add_result)
-    await _callback_message(callback, _success_message(add_result))
+    reply_markup = await _finalize_save(state, data, add_result)
+    await _callback_message(
+        callback, _success_message(add_result), reply_markup=reply_markup
+    )
 
 
-async def _arm_undo(
+async def _finalize_save(
     state: FSMContext,
     data: dict[str, object],
     add_result: AddResult,
-) -> None:
+) -> object | None:
+    """Arm undo only while cycle stays COLLECTING; never after 5/5 COMPLETED."""
+    if add_result.status != AuditCycleStatus.COLLECTING:
+        await state.clear()
+        return None
+
+    undo_token = uuid4().hex[:12]
     await state.set_state(UploadStates.can_undo)
     await state.set_data(
         {
@@ -540,10 +656,12 @@ async def _arm_undo(
             "sha256": data["sha256"],
             "original_filename": data["original_filename"],
             "report_date": data["report_date"],
+            "undo_token": undo_token,
             "undo_source_file_id": add_result.source_file_id,
             "undo_previous_source_file_id": add_result.previous_source_file_id,
         }
     )
+    return undo_offer_keyboard(undo_token)
 
 
 def _business_error_message(exc: Exception) -> str:
@@ -564,6 +682,11 @@ def _business_error_message(exc: Exception) -> str:
 def _withdraw_error_message(exc: Exception) -> str:
     if isinstance(exc, SourceFileNotFoundError):
         return "Файл для отмены уже не найден. Проверьте /status."
+    if isinstance(exc, CycleImmutableError):
+        return (
+            f"Аудит за {exc.report_date:%d.%m.%Y} уже закрыт; "
+            "отмена недоступна. Проверьте /status."
+        )
     if isinstance(exc, WithdrawNotAllowedError):
         return f"Отмена недоступна: {exc}. Проверьте /status."
     if isinstance(exc, AuditCycleNotFoundError):
@@ -578,15 +701,14 @@ def _success_message(result: AddResult) -> str:
         else ""
     )
     if result.status == AuditCycleStatus.COMPLETED:
-        body = (
+        return (
             f"Аудит за {result.report_date:%d.%m.%Y}: 5/5 — комплект собран{debt}."
         )
-    else:
-        body = (
-            f"Аудит за {result.report_date:%d.%m.%Y}: "
-            f"{len(result.summary.present)}/5 файлов получено{debt}."
-        )
-    return f"{body}\nЕсли отдел выбран ошибочно — /undo."
+    return (
+        f"Аудит за {result.report_date:%d.%m.%Y}: "
+        f"{len(result.summary.present)}/5 файлов получено{debt}.\n"
+        "Если отдел выбран ошибочно — нажмите кнопку ниже или /undo."
+    )
 
 
 async def _callback_message(
@@ -604,7 +726,7 @@ def get_upload_router() -> Router:
     router.message.register(handle_cancel, Command("cancel"))
     router.message.register(handle_undo, Command("undo"))
     router.message.register(handle_document, F.document)
-    # deptconfirm before dept: — иначе prefix "dept:" перехватит "deptconfirm:".
+    # Longer prefixes before shorter ones (deptconfirm before dept, etc.).
     router.callback_query.register(
         handle_department_confirm_callback,
         F.data.startswith("deptconfirm:"),
@@ -620,5 +742,13 @@ def get_upload_router() -> Router:
     router.callback_query.register(
         handle_replace_callback,
         F.data.startswith("replace:"),
+    )
+    router.callback_query.register(
+        handle_undo_offer_callback,
+        F.data.startswith("undooffer:"),
+    )
+    router.callback_query.register(
+        handle_undo_confirm_callback,
+        F.data.startswith("undoconfirm:"),
     )
     return router

@@ -36,7 +36,7 @@ source .venv/bin/activate
 pip install -r requirements-dev.txt
 
 cp .env.example .env
-# заполнить BOT_TOKEN, ALLOWED_USER_ID, DB_* (значения роли/БД из шага выше),
+# заполнить BOT_TOKEN, ALLOWED_USER_IDS, DB_* (значения роли/БД из шага выше),
 # AUDIT_IDLE_TIMEOUT_SECONDS
 
 # применить миграции (после появления доменных моделей на Stage 2+)

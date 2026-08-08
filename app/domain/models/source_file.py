@@ -12,7 +12,7 @@ import datetime as dt
 import enum
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import JSON, Date, DateTime, Enum, ForeignKey, Text, UniqueConstraint, func
+from sqlalchemy import JSON, Date, DateTime, Enum, ForeignKey, Index, Text, func, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.domain.enums import Department
@@ -38,11 +38,19 @@ class SourceFileStatus(str, enum.Enum):
 class SourceFileLifecycle(str, enum.Enum):
     ACTIVE = "active"
     SUPERSEDED = "superseded"
+    REVOKED = "revoked"
 
 
 class SourceFile(Base):
     __tablename__ = "source_files"
-    __table_args__ = (UniqueConstraint("sha256", name="uq_source_file_sha256"),)
+    __table_args__ = (
+        Index(
+            "uq_source_file_sha256_active_or_superseded",
+            "sha256",
+            unique=True,
+            postgresql_where=text("lifecycle_status IN ('active', 'superseded')"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     audit_cycle_id: Mapped[int | None] = mapped_column(
@@ -73,5 +81,5 @@ class SourceFile(Base):
         server_default=SourceFileLifecycle.ACTIVE.value,
     )
 
-    debt_positions: Mapped[list["DebtPosition"]] = relationship(back_populates="source_file")
-    audit_cycle: Mapped["AuditCycle | None"] = relationship(back_populates="source_files")
+    debt_positions: Mapped[list[DebtPosition]] = relationship(back_populates="source_file")
+    audit_cycle: Mapped[AuditCycle | None] = relationship(back_populates="source_files")

@@ -10,19 +10,21 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-import app.application.audit_service as audit_service
+from app.application import audit_service
 from app.application.audit_service import (
     AuditCycleNotFoundError,
     CycleImmutableError,
     DepartmentSlotTakenError,
     DuplicateSourceFileError,
     StaleReplacementError,
+    WithdrawNotAllowedError,
     add_source_file_atomic,
     count_collecting_cycles,
     find_audit_cycle_by_report_date,
     find_source_file_by_sha256,
     get_active_source_file,
     replace_source_file_atomic,
+    withdraw_source_file_atomic,
 )
 from app.domain.enums import Department
 from app.domain.models import (
@@ -32,7 +34,10 @@ from app.domain.models import (
     SourceFileLifecycle,
     SourceFileStatus,
 )
-from app.infrastructure.excel.validator import ValidationResult, validate_confirmed_template_file
+from app.infrastructure.excel.validator import (
+    ValidationResult,
+    validate_confirmed_template_file,
+)
 
 FIXTURE = (
     Path(__file__).resolve().parents[1]
@@ -542,6 +547,12 @@ async def test_enum_values_roundtrip_through_orm(
                     SourceFileLifecycle.SUPERSEDED,
                     Department.MOSCOW,
                 ),
+                _minimal_source(
+                    "enum-revoked",
+                    None,
+                    SourceFileLifecycle.REVOKED,
+                    Department.SZFO_1,
+                ),
             ]
         )
 
@@ -649,6 +660,211 @@ async def test_replace_never_commits_superseded_without_new_active_file(
             )
         ).all()
     assert rows == [("atomic-order-old", SourceFileLifecycle.ACTIVE)]
+
+
+@pytest.mark.asyncio
+async def test_withdraw_revokes_without_deleting_and_frees_sha(
+    stage3_session: AsyncSession,
+    valid_result: ValidationResult,
+) -> None:
+    added = await add(
+        stage3_session, valid_result, Department.REGIONAL, sha="revoke-sha"
+    )
+    withdrawn = await withdraw_source_file_atomic(
+        stage3_session, source_file_id=added.source_file_id
+    )
+    assert withdrawn.status == AuditCycleStatus.COLLECTING
+    assert withdrawn.summary.present == frozenset()
+
+    async with stage3_session.begin():
+        row = await stage3_session.scalar(
+            select(SourceFile).where(SourceFile.id == added.source_file_id)
+        )
+        assert row is not None
+        assert row.lifecycle_status == SourceFileLifecycle.REVOKED
+
+    assert await find_source_file_by_sha256(stage3_session, "revoke-sha") is None
+    again = await add(
+        stage3_session, valid_result, Department.MOSCOW, sha="revoke-sha"
+    )
+    assert again.source_file_id != added.source_file_id
+
+
+@pytest.mark.asyncio
+async def test_withdraw_replace_restores_previous_superseded(
+    stage3_session: AsyncSession,
+    valid_result: ValidationResult,
+) -> None:
+    first = await add(
+        stage3_session, valid_result, Department.REGIONAL, sha="undo-rep-old"
+    )
+    second = await replace_source_file_atomic(
+        stage3_session,
+        result=valid_result,
+        department=Department.REGIONAL,
+        sha256="undo-rep-new",
+        original_filename="undo-rep-new.xls",
+        report_date=REPORT_DATE,
+        expected_active_source_file_id=first.source_file_id,
+    )
+    result = await withdraw_source_file_atomic(
+        stage3_session,
+        source_file_id=second.source_file_id,
+        previous_source_file_id=first.source_file_id,
+    )
+    assert result.restored_source_file_id == first.source_file_id
+
+    async with stage3_session.begin():
+        rows = (
+            await stage3_session.execute(
+                select(SourceFile.id, SourceFile.lifecycle_status).order_by(SourceFile.id)
+            )
+        ).all()
+    assert rows == [
+        (first.source_file_id, SourceFileLifecycle.ACTIVE),
+        (second.source_file_id, SourceFileLifecycle.REVOKED),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_withdraw_refuses_completed_cycle_without_reopening(
+    stage3_session: AsyncSession,
+    valid_result: ValidationResult,
+) -> None:
+    results = []
+    for index, department in enumerate(Department):
+        results.append(
+            await add(
+                stage3_session,
+                valid_result,
+                department,
+                sha=f"complete-{index}",
+            )
+        )
+    assert results[-1].status == AuditCycleStatus.COMPLETED
+
+    with pytest.raises(CycleImmutableError):
+        await withdraw_source_file_atomic(
+            stage3_session, source_file_id=results[-1].source_file_id
+        )
+
+    async with stage3_session.begin():
+        cycle = await stage3_session.scalar(
+            select(AuditCycle).where(AuditCycle.id == results[-1].cycle_id)
+        )
+        assert cycle is not None
+        assert cycle.status == AuditCycleStatus.COMPLETED
+        assert await stage3_session.scalar(
+            select(func.count(SourceFile.id)).where(
+                SourceFile.lifecycle_status == SourceFileLifecycle.ACTIVE
+            )
+        ) == 5
+
+
+@pytest.mark.asyncio
+async def test_withdraw_refuses_expired_cycle(
+    stage3_session: AsyncSession,
+    valid_result: ValidationResult,
+) -> None:
+    added = await add(
+        stage3_session, valid_result, Department.REGIONAL, sha="expired-undo"
+    )
+    async with stage3_session.begin():
+        cycle = await stage3_session.scalar(
+            select(AuditCycle).where(AuditCycle.id == added.cycle_id)
+        )
+        assert cycle is not None
+        cycle.status = AuditCycleStatus.EXPIRED
+
+    with pytest.raises(CycleImmutableError):
+        await withdraw_source_file_atomic(
+            stage3_session, source_file_id=added.source_file_id
+        )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_withdraw_and_replace_are_serialized(
+    stage3_session_maker: async_sessionmaker[AsyncSession],
+    valid_result: ValidationResult,
+) -> None:
+    """Two sessions: undo vs replace — exactly one wins; no corrupted ACTIVE slot."""
+    async with stage3_session_maker() as session:
+        first = await add(
+            session, valid_result, Department.REGIONAL, sha="race-old"
+        )
+        second = await replace_source_file_atomic(
+            session,
+            result=valid_result,
+            department=Department.REGIONAL,
+            sha256="race-new",
+            original_filename="race-new.xls",
+            report_date=REPORT_DATE,
+            expected_active_source_file_id=first.source_file_id,
+        )
+
+    barrier = asyncio.Barrier(2)
+    outcomes: list[str] = []
+
+    async def do_withdraw() -> None:
+        async with stage3_session_maker() as session:
+            await barrier.wait()
+            try:
+                await withdraw_source_file_atomic(
+                    session,
+                    source_file_id=second.source_file_id,
+                    previous_source_file_id=first.source_file_id,
+                )
+                outcomes.append("withdraw")
+            except (
+                WithdrawNotAllowedError,
+                StaleReplacementError,
+                CycleImmutableError,
+                DepartmentSlotTakenError,
+            ):
+                outcomes.append("withdraw_fail")
+
+    async def do_replace() -> None:
+        async with stage3_session_maker() as session:
+            await barrier.wait()
+            try:
+                await replace_source_file_atomic(
+                    session,
+                    result=valid_result,
+                    department=Department.REGIONAL,
+                    sha256="race-third",
+                    original_filename="race-third.xls",
+                    report_date=REPORT_DATE,
+                    expected_active_source_file_id=second.source_file_id,
+                )
+                outcomes.append("replace")
+            except (
+                StaleReplacementError,
+                WithdrawNotAllowedError,
+                DepartmentSlotTakenError,
+                CycleImmutableError,
+            ):
+                outcomes.append("replace_fail")
+
+    await asyncio.gather(do_withdraw(), do_replace())
+    assert len(outcomes) == 2
+    assert "withdraw" in outcomes or "replace" in outcomes
+
+    async with stage3_session_maker() as session, session.begin():
+        active = (
+            await session.scalars(
+                select(SourceFile).where(
+                    SourceFile.lifecycle_status == SourceFileLifecycle.ACTIVE,
+                    SourceFile.department == Department.REGIONAL,
+                )
+            )
+        ).all()
+        assert len(active) == 1
+        lifecycles = set(
+            (
+                await session.scalars(select(SourceFile.lifecycle_status))
+            ).all()
+        )
+        assert SourceFileLifecycle.ACTIVE in lifecycles
 
 
 def _minimal_source(

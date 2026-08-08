@@ -14,6 +14,7 @@ from app.application.audit_service import (
     find_audit_cycle_by_report_date,
     replace_source_file_atomic,
 )
+from app.bot.handlers.status import handle_status
 from app.bot.handlers.upload import (
     UploadStates,
     handle_department_callback,
@@ -22,8 +23,9 @@ from app.bot.handlers.upload import (
     handle_new_cycle_callback,
     handle_replace_callback,
     handle_undo,
+    handle_undo_confirm_callback,
+    handle_undo_offer_callback,
 )
-from app.bot.handlers.status import handle_status
 from app.domain.enums import Department
 from app.domain.models import (
     AuditCycle,
@@ -32,7 +34,10 @@ from app.domain.models import (
     SourceFileLifecycle,
 )
 from app.infrastructure.excel.checksum import compute_sha256
-from app.infrastructure.excel.validator import ValidationResult, validate_confirmed_template_file
+from app.infrastructure.excel.validator import (
+    ValidationResult,
+    validate_confirmed_template_file,
+)
 from tests.fixtures.generate_regional_fixtures import _basic_spec
 from tests.fixtures.regional_builder import build_regional_xls
 
@@ -191,12 +196,14 @@ async def test_department_selection_saves_new_file(
     await receive_valid(stage3_session, state)
     choose = await choose_department(stage3_session, state)
     assert "Назначить файл" in choose.message.answers[-1][0]
+    assert "долг:" in choose.message.answers[-1][0]
     assert state.state == UploadStates.confirming_department.state
 
     confirm = await confirm_department(stage3_session, state)
     assert "1/5" in confirm.message.answers[-1][0]
     assert "долг" in confirm.message.answers[-1][0]
     assert "/undo" in confirm.message.answers[-1][0]
+    assert confirm.message.answers[-1][1] is not None
     assert confirm.answer_count == 1
     assert state.state == UploadStates.can_undo.state
     async with stage3_session.begin():
@@ -221,7 +228,7 @@ async def test_department_confirm_other_returns_to_department_buttons(
 
 
 @pytest.mark.asyncio
-async def test_undo_withdraws_wrong_department_and_allows_reassign(
+async def test_undo_requires_confirmation_then_revokes_and_allows_reassign(
     stage3_session: AsyncSession,
 ) -> None:
     state = FakeState()
@@ -230,21 +237,110 @@ async def test_undo_withdraws_wrong_department_and_allows_reassign(
     assert state.state == UploadStates.can_undo.state
     sha = state.data["sha256"]
 
-    undo_message = FakeMessage()
-    await handle_undo(undo_message, state, stage3_session)  # type: ignore[arg-type]
+    # /undo only opens confirmation
+    prompt = FakeMessage()
+    await handle_undo(prompt, state)  # type: ignore[arg-type]
+    assert state.state == UploadStates.confirming_undo.state
+    assert "Отменить последнюю загрузку?" in prompt.answers[-1][0]
 
-    assert "Снял файл" in undo_message.answers[-1][0]
-    assert "Выберите правильный отдел" in undo_message.answers[-1][0]
+    # Stale token rejected
+    stale = FakeCallback("undoconfirm:obsolete:confirm")
+    await handle_undo_confirm_callback(stale, state, stage3_session)  # type: ignore[arg-type]
+    assert "устарела" in stale.message.answers[-1][0]
+    assert state.state == UploadStates.confirming_undo.state
+
+    confirm = FakeCallback(f"undoconfirm:{state.data['undo_token']}:confirm")
+    await handle_undo_confirm_callback(confirm, state, stage3_session)  # type: ignore[arg-type]
+
+    assert "Снял файл" in confirm.message.answers[-1][0]
+    assert "Выберите правильный отдел" in confirm.message.answers[-1][0]
     assert state.state == UploadStates.choosing_department.state
     async with stage3_session.begin():
-        assert await stage3_session.scalar(select(func.count(SourceFile.id))) == 0
+        rows = (
+            await stage3_session.execute(
+                select(SourceFile.lifecycle_status, SourceFile.sha256)
+            )
+        ).all()
+        assert len(rows) == 1
+        assert rows[0][0] == SourceFileLifecycle.REVOKED
+        assert rows[0][1] == sha
 
+    # Same SHA can be assigned again after REVOKED
     await choose_and_confirm_department(stage3_session, state, Department.REGIONAL)
     async with stage3_session.begin():
-        row = await stage3_session.scalar(select(SourceFile))
-        assert row is not None
-        assert row.department == Department.REGIONAL
-        assert row.sha256 == sha
+        active = await stage3_session.scalar(
+            select(SourceFile).where(
+                SourceFile.lifecycle_status == SourceFileLifecycle.ACTIVE
+            )
+        )
+        assert active is not None
+        assert active.department == Department.REGIONAL
+        assert active.sha256 == sha
+        revoked_count = await stage3_session.scalar(
+            select(func.count(SourceFile.id)).where(
+                SourceFile.lifecycle_status == SourceFileLifecycle.REVOKED
+            )
+        )
+        assert revoked_count == 1
+
+
+@pytest.mark.asyncio
+async def test_completed_five_of_five_does_not_offer_undo(
+    stage3_session: AsyncSession,
+    valid_result: ValidationResult,
+) -> None:
+    for index, department in enumerate(list(Department)[:-1]):
+        await seed_file(
+            stage3_session,
+            valid_result,
+            department,
+            f"complete-pre-{index}",
+        )
+
+    state = FakeState()
+    await receive_valid(stage3_session, state)
+    confirm = await choose_and_confirm_department(
+        stage3_session, state, list(Department)[-1]
+    )
+    assert "5/5" in confirm.message.answers[-1][0]
+    assert "/undo" not in confirm.message.answers[-1][0]
+    assert confirm.message.answers[-1][1] is None
+    assert state.state is None
+
+
+@pytest.mark.asyncio
+async def test_undo_offer_button_opens_same_confirmation(
+    stage3_session: AsyncSession,
+) -> None:
+    state = FakeState()
+    await receive_valid(stage3_session, state)
+    await choose_and_confirm_department(stage3_session, state)
+    token = state.data["undo_token"]
+    offer = FakeCallback(f"undooffer:{token}:start")
+    await handle_undo_offer_callback(offer, state)  # type: ignore[arg-type]
+    assert state.state == UploadStates.confirming_undo.state
+    assert "Отменить последнюю загрузку?" in offer.message.answers[-1][0]
+
+
+@pytest.mark.asyncio
+async def test_keep_file_on_undo_confirmation_preserves_active(
+    stage3_session: AsyncSession,
+) -> None:
+    state = FakeState()
+    await receive_valid(stage3_session, state)
+    await choose_and_confirm_department(stage3_session, state)
+    await handle_undo(FakeMessage(), state)  # type: ignore[arg-type]
+    keep = FakeCallback(f"undoconfirm:{state.data['undo_token']}:keep")
+    await handle_undo_confirm_callback(keep, state, stage3_session)  # type: ignore[arg-type]
+
+    assert "оставлен" in keep.message.answers[-1][0]
+    assert state.state == UploadStates.can_undo.state
+    async with stage3_session.begin():
+        assert await stage3_session.scalar(
+            select(func.count(SourceFile.id)).where(
+                SourceFile.lifecycle_status == SourceFileLifecycle.ACTIVE
+            )
+        ) == 1
 
 
 @pytest.mark.asyncio
@@ -488,14 +584,19 @@ async def test_callback_token_rejected_after_state_cleared_like_bot_restart(
     token = live_state.data["upload_token"]
 
     restarted_state = FakeState()  # empty FSM after MemoryStorage restart
-    for callback_data, handler in (
-        (f"dept:{token}:{Department.REGIONAL.value}", handle_department_callback),
-        (f"deptconfirm:{token}:confirm", handle_department_confirm_callback),
-        (f"newcycle:{token}:confirm", handle_new_cycle_callback),
-        (f"replace:{token}:confirm", handle_replace_callback),
+    for callback_data, handler, needs_session in (
+        (f"dept:{token}:{Department.REGIONAL.value}", handle_department_callback, True),
+        (f"deptconfirm:{token}:confirm", handle_department_confirm_callback, True),
+        (f"newcycle:{token}:confirm", handle_new_cycle_callback, True),
+        (f"replace:{token}:confirm", handle_replace_callback, True),
+        (f"undooffer:{token}:start", handle_undo_offer_callback, False),
+        (f"undoconfirm:{token}:confirm", handle_undo_confirm_callback, True),
     ):
         callback = FakeCallback(callback_data)
-        await handler(callback, restarted_state, stage3_session)  # type: ignore[arg-type]
+        if needs_session:
+            await handler(callback, restarted_state, stage3_session)  # type: ignore[arg-type]
+        else:
+            await handler(callback, restarted_state)  # type: ignore[arg-type]
         assert "устарела" in callback.message.answers[-1][0]
         assert callback.answer_count == 1
 

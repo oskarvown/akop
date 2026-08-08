@@ -25,6 +25,36 @@ def department_confirm_keyboard(upload_token: str) -> InlineKeyboardMarkup:
     )
 
 
+def undo_offer_keyboard(undo_token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Отменить последнюю загрузку",
+                    callback_data=f"undooffer:{undo_token}:start",
+                )
+            ]
+        ]
+    )
+
+
+def undo_confirm_keyboard(undo_token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Подтвердить отмену",
+                    callback_data=f"undoconfirm:{undo_token}:confirm",
+                ),
+                InlineKeyboardButton(
+                    text="Оставить файл",
+                    callback_data=f"undoconfirm:{undo_token}:keep",
+                ),
+            ]
+        ]
+    )
+
+
 def replacement_keyboard(upload_token: str) -> InlineKeyboardMarkup:
     return _confirmation_keyboard(
         confirm_text="Заменить",
