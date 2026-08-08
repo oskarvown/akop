@@ -197,14 +197,23 @@ def test_control_rollups_cover_all_additive_metrics() -> None:
         # L2 disclosure — must not enter rollups
         _pos(key="c:1|2:x", pid=3, level=2, total_debt=Decimal("999")),
     ]
-    checks = build_l1_control_equalities(positions)
-    additive_names = [c.name for c in checks if not c.diagnostic]
+    checks = {c.name: c for c in build_l1_control_equalities(positions)}
     for metric in ADDITIVE_METRICS:
-        company = next(
-            c for c in checks if c.name == f"company_{metric}_vs_sum_departments"
-        )
+        company = checks[f"company_{metric}_vs_sum_departments"]
         assert company.ok is True
-        assert any(metric in name for name in additive_names)
+        for dept in ("regional", "moscow"):
+            dept_check = checks[
+                f"department_{dept}_{metric}_vs_sum_manager_groups"
+            ]
+            assert dept_check.ok is True
+        for mg_id in (10, 20):
+            mg_check = checks[
+                f"manager_group_{mg_id}_{metric}_vs_sum_counterparties"
+            ]
+            assert mg_check.ok is True
+    assert checks["l2_l4_disclosure_only"].diagnostic is True
+    # L2 debt must not inflate company totals
+    assert checks["company_total_debt_vs_sum_departments"].left == Decimal("100")
 
 
 def test_source_file_grand_totals_ok_and_mismatch() -> None:
