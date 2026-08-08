@@ -15,6 +15,7 @@ from app.application.comparison_service import (
     MatchedEntity,
     MetricDelta,
     PositionSnapshot,
+    build_l1_control_equalities,
     compare_position_sets,
     compute_metric_deltas,
 )
@@ -33,6 +34,8 @@ from app.application.report_workbook import (
     SUMMARY_HEADERS,
     aggregate_metric_deltas,
     build_core_excel_bytes,
+    build_department_rows,
+    build_manager_group_rows,
     change_class,
     sanitize_excel_text,
 )
@@ -458,8 +461,128 @@ def test_freeze_autofilter_and_money_formats() -> None:
     assert isinstance(counterparties.cell(2, curr_col).value, (int, float, Decimal))
 
 
+def test_empty_money_cells_keep_money_format_after_roundtrip() -> None:
+    # Baseline without previous + one NULL metric + control equality with empty sides.
+    curr = _pos(
+        pid=1,
+        key="c:1",
+        total=Decimal("100"),
+        metrics_extra={"advance": None},
+    )
+    comparison = _comparison(
+        [_entity(curr, None)],
+        previous_cycle_id=None,
+        previous_positions=[],
+        current_positions=[curr],
+    )
+    comparison = CycleComparison(
+        current_cycle_id=comparison.current_cycle_id,
+        current_report_date=comparison.current_report_date,
+        previous_cycle_id=None,
+        previous_report_date=None,
+        entities=comparison.entities,
+        collisions=(),
+        control_equalities=(
+            ControlEquality(
+                name="l2_l4_disclosure_only",
+                left=None,
+                right=None,
+                ok=True,
+                diagnostic=True,
+            ),
+        ),
+        ambiguous_keys=frozenset(),
+        current_positions=(curr,),
+        previous_positions=(),
+    )
+    raw, _ = build_core_excel_bytes(comparison)
+    wb = openpyxl.load_workbook(BytesIO(raw))
+
+    money_suffixes = ("current", "previous", "abs_delta")
+    for sheet_name in (
+        "Сводка",
+        "Отделы",
+        "ManagerGroup",
+        "Контрагенты",
+        "Договоры",
+        "Документы",
+        "Изменения",
+    ):
+        ws = wb[sheet_name]
+        headers = _header_row(ws)
+        if sheet_name == "Сводка":
+            for col_name in ("current", "previous", "abs_delta"):
+                col = headers.index(col_name) + 1
+                for row in range(2, 2 + len(ADDITIVE_METRICS)):
+                    assert ws.cell(row, col).number_format == MONEY_FORMAT
+            continue
+        for metric in ADDITIVE_METRICS:
+            for suffix in money_suffixes:
+                header = f"{metric} {suffix}"
+                if header not in headers:
+                    continue
+                col = headers.index(header) + 1
+                for row in range(2, ws.max_row + 1):
+                    assert ws.cell(row, col).number_format == MONEY_FORMAT, (
+                        sheet_name,
+                        header,
+                        row,
+                    )
+
+    # Explicit NULL/baseline spots.
+    cp = wb["Контрагенты"]
+    cp_headers = _header_row(cp)
+    assert cp.cell(2, cp_headers.index("total_debt previous") + 1).value is None
+    assert (
+        cp.cell(2, cp_headers.index("total_debt previous") + 1).number_format
+        == MONEY_FORMAT
+    )
+    assert cp.cell(2, cp_headers.index("advance current") + 1).value is None
+    assert (
+        cp.cell(2, cp_headers.index("advance current") + 1).number_format
+        == MONEY_FORMAT
+    )
+    assert cp.cell(2, cp_headers.index("advance abs_delta") + 1).value is None
+    assert (
+        cp.cell(2, cp_headers.index("advance abs_delta") + 1).number_format
+        == MONEY_FORMAT
+    )
+
+    control = wb["Контроль"]
+    ctrl_headers = _header_row(control)
+    left_col = ctrl_headers.index("left") + 1
+    right_col = ctrl_headers.index("right") + 1
+    disclosure_row = next(
+        r
+        for r in range(2, control.max_row + 1)
+        if control.cell(r, ctrl_headers.index("имя") + 1).value
+        == "l2_l4_disclosure_only"
+    )
+    assert control.cell(disclosure_row, left_col).value is None
+    assert control.cell(disclosure_row, right_col).value is None
+    assert control.cell(disclosure_row, left_col).number_format == MONEY_FORMAT
+    assert control.cell(disclosure_row, right_col).number_format == MONEY_FORMAT
+
+
 def test_aggregates_match_stage41_control_style_sum() -> None:
-    p1 = _pos(pid=1, key="c:1", total=Decimal("40"), department="regional")
+    p1 = _pos(
+        pid=1,
+        key="c:1",
+        total=Decimal("40"),
+        department="regional",
+        manager_group_id=1,
+        counterparty_id=1,
+        metrics_extra={
+            "document_amount": Decimal("11"),
+            "advance": Decimal("2"),
+            "not_due": Decimal("3"),
+            "overdue_1_7": Decimal("4"),
+            "overdue_8_14": Decimal("5"),
+            "overdue_15_21": Decimal("6"),
+            "overdue_22_30": Decimal("7"),
+            "overdue_over_31": Decimal("8"),
+        },
+    )
     p2 = _pos(
         pid=2,
         key="c:2",
@@ -467,20 +590,131 @@ def test_aggregates_match_stage41_control_style_sum() -> None:
         department="moscow",
         manager_group_id=2,
         counterparty_id=2,
+        manager_group_name="Petrov",
+        counterparty_name="Beta",
+        metrics_extra={
+            "document_amount": Decimal("21"),
+            "advance": Decimal("12"),
+            "not_due": Decimal("13"),
+            "overdue_1_7": Decimal("14"),
+            "overdue_8_14": Decimal("15"),
+            "overdue_15_21": Decimal("16"),
+            "overdue_22_30": Decimal("17"),
+            "overdue_over_31": Decimal("18"),
+        },
     )
-    # L2 must not affect company aggregate
+    # L2–L4 with large values must not affect company/department/MG aggregates.
     l2 = _pos(
         pid=3,
         key="c:1|2:x",
         level=2,
         total=Decimal("999"),
         parent_position_id=1,
+        metrics_extra={m: Decimal("1000") for m in ADDITIVE_METRICS},
     )
-    company = aggregate_metric_deltas(
-        current_positions=[p1, p2, l2],
+    l3 = _pos(
+        pid=4,
+        key="c:1|2:x|3:y",
+        level=3,
+        total=Decimal("888"),
+        parent_position_id=3,
+        metrics_extra={m: Decimal("2000") for m in ADDITIVE_METRICS},
+    )
+    l4 = _pos(
+        pid=5,
+        key="c:1|2:x|3:y|4:z",
+        level=4,
+        total=Decimal("777"),
+        parent_position_id=4,
+        metrics_extra={m: Decimal("3000") for m in ADDITIVE_METRICS},
+    )
+    positions = [p1, p2, l2, l3, l4]
+    controls = build_l1_control_equalities(positions)
+    control_by_name = {c.name: c for c in controls}
+
+    entities = [
+        _entity(p1, None),
+        _entity(p2, None),
+        _entity(l2, None),
+        _entity(l3, None),
+        _entity(l4, None),
+    ]
+    comparison = _comparison(
+        entities,
+        current_positions=positions,
         previous_positions=[],
+        previous_cycle_id=None,
     )
-    assert company["total_debt"].current == Decimal("100")
+    raw, _ = build_core_excel_bytes(comparison)
+    wb = openpyxl.load_workbook(BytesIO(raw))
+
+    # Company: workbook Сводка current == Control company rollup left.
+    summary = wb["Сводка"]
+    summary_current = {
+        summary.cell(r, 1).value: summary.cell(r, 2).value
+        for r in range(2, 2 + len(ADDITIVE_METRICS))
+    }
+    for metric in ADDITIVE_METRICS:
+        expected = control_by_name[f"company_{metric}_vs_sum_departments"].left
+        assert Decimal(str(summary_current[metric])) == expected
+
+    # Department sheet currents match Control department left sides.
+    dept_sheet = wb["Отделы"]
+    dept_headers = _header_row(dept_sheet)
+    dept_rows = {
+        dept_sheet.cell(r, dept_headers.index("department_key") + 1).value: r
+        for r in range(2, dept_sheet.max_row + 1)
+    }
+    for dept, row in dept_rows.items():
+        for metric in ADDITIVE_METRICS:
+            expected = control_by_name[
+                f"department_{dept}_{metric}_vs_sum_manager_groups"
+            ].left
+            col = dept_headers.index(f"{metric} current") + 1
+            assert Decimal(str(dept_sheet.cell(row, col).value)) == expected
+
+    # ManagerGroup sheet currents match Control MG left sides.
+    mg_sheet = wb["ManagerGroup"]
+    mg_headers = _header_row(mg_sheet)
+    mg_rows = {
+        int(mg_sheet.cell(r, mg_headers.index("manager_group_id") + 1).value): r
+        for r in range(2, mg_sheet.max_row + 1)
+    }
+    for mg_id, row in mg_rows.items():
+        for metric in ADDITIVE_METRICS:
+            expected = control_by_name[
+                f"manager_group_{mg_id}_{metric}_vs_sum_counterparties"
+            ].left
+            col = mg_headers.index(f"{metric} current") + 1
+            assert Decimal(str(mg_sheet.cell(row, col).value)) == expected
+
+    # Helper aggregates agree with the same Control totals.
+    company = aggregate_metric_deltas(
+        current_positions=positions, previous_positions=[]
+    )
+    for metric in ADDITIVE_METRICS:
+        assert (
+            company[metric].current
+            == control_by_name[f"company_{metric}_vs_sum_departments"].left
+        )
+    for row in build_department_rows(comparison):
+        for metric in ADDITIVE_METRICS:
+            assert (
+                row.deltas[metric].current
+                == control_by_name[
+                    f"department_{row.department_key}_{metric}_vs_sum_manager_groups"
+                ].left
+            )
+    for row in build_manager_group_rows(comparison):
+        assert row.manager_group_id is not None
+        for metric in ADDITIVE_METRICS:
+            assert (
+                row.deltas[metric].current
+                == control_by_name[
+                    f"manager_group_{row.manager_group_id}_{metric}"
+                    "_vs_sum_counterparties"
+                ].left
+            )
 
 
 def test_rebuild_same_bytes_and_sha() -> None:

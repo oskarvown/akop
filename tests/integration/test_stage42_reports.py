@@ -8,7 +8,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import event, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -225,46 +225,33 @@ async def test_artifact_insert_failure_rolls_back_ready(
         report = await session.get(AuditReport, report_id)
         assert report is not None
         assert report.status == AuditReportStatus.BUILDING
-        input_hash = report.input_hash
-        generator_version = report.generator_version
-        schema_version = report.schema_version
+        claimed_at_before = report.build_claimed_at
+        assert claimed_at_before is not None
 
-    # Simulate complete_report_build success path with an invalid CORE revision.
-    with pytest.raises(IntegrityError):
-        async with stage3_session_maker() as session:
-            async with session.begin():
-                report = await session.scalar(
-                    select(AuditReport)
-                    .where(AuditReport.id == report_id)
-                    .with_for_update()
+    def _boom_before_insert(mapper, connection, target) -> None:  # noqa: ARG001
+        raise RuntimeError("forced AuditArtifact insert failure")
+
+    event.listen(AuditArtifact, "before_insert", _boom_before_insert)
+    try:
+        with pytest.raises(RuntimeError, match="forced AuditArtifact insert failure"):
+            async with stage3_session_maker() as session:
+                await complete_report_build(
+                    session,
+                    report_id=report_id,
+                    claim_token=claim.claim_token,
+                    summary_json=result.summary_json,
+                    excel_bytes=result.excel_bytes,
+                    excel_sha256=result.excel_sha256,
                 )
-                assert report is not None
-                assert report.build_claim_token == claim.claim_token
-                session.add(
-                    AuditArtifact(
-                        audit_report_id=report_id,
-                        kind=AuditArtifactKind.CORE,
-                        revision=0,  # violates ck_audit_artifact_revision_ge_1
-                        excel_bytes=result.excel_bytes,
-                        excel_sha256=result.excel_sha256,
-                        financial_input_hash=input_hash,
-                        enrichment_input_hash=None,
-                        generator_version=generator_version,
-                        schema_version=schema_version,
-                    )
-                )
-                report.status = AuditReportStatus.READY
-                report.summary_json = result.summary_json
-                report.built_at = dt.datetime.now(dt.timezone.utc)
-                report.build_claim_token = None
-                report.build_claimed_at = None
-                await session.flush()
+    finally:
+        event.remove(AuditArtifact, "before_insert", _boom_before_insert)
 
     async with stage3_session_maker() as session:
         report = await session.get(AuditReport, report_id)
         assert report is not None
         assert report.status == AuditReportStatus.BUILDING
         assert report.build_claim_token == claim.claim_token
+        assert report.build_claimed_at == claimed_at_before
         assert report.summary_json is None
         assert report.built_at is None
         assert (

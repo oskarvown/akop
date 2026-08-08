@@ -537,8 +537,7 @@ def _set_money(cell) -> None:
 
 def _write_money(ws: Worksheet, row: int, col: int, value: Decimal | None):
     cell = ws.cell(row, col, value)
-    if value is not None:
-        _set_money(cell)
+    cell.number_format = MONEY_FORMAT
     return cell
 
 
