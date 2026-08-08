@@ -20,6 +20,7 @@ from app.application.comparison_service import (
     find_previous_completed_cycle,
     summarize_comparison,
 )
+from app.application.report_delivery_service import enqueue_automatic_delivery
 from app.application.report_workbook import build_core_excel_bytes
 from app.domain.models import (
     AuditArtifact,
@@ -414,19 +415,18 @@ async def complete_report_build(
         if existing_core is not None:
             raise ReportServiceError("CORE artifact already exists for report")
 
-        session.add(
-            AuditArtifact(
-                audit_report_id=report.id,
-                kind=AuditArtifactKind.CORE,
-                revision=1,
-                excel_bytes=excel_bytes,
-                excel_sha256=excel_sha256,
-                financial_input_hash=report.input_hash,
-                enrichment_input_hash=None,
-                generator_version=report.generator_version,
-                schema_version=report.schema_version,
-            )
+        artifact = AuditArtifact(
+            audit_report_id=report.id,
+            kind=AuditArtifactKind.CORE,
+            revision=1,
+            excel_bytes=excel_bytes,
+            excel_sha256=excel_sha256,
+            financial_input_hash=report.input_hash,
+            enrichment_input_hash=None,
+            generator_version=report.generator_version,
+            schema_version=report.schema_version,
         )
+        session.add(artifact)
         report.status = AuditReportStatus.READY
         report.summary_json = summary_json
         report.built_at = func.clock_timestamp()
@@ -434,6 +434,9 @@ async def complete_report_build(
         report.build_claimed_at = None
         report.last_build_error = None
         report.next_retry_at = None
+        await session.flush()
+        # Same txn: CORE + READY + automatic PENDING (rollback together on failure).
+        await enqueue_automatic_delivery(session, artifact)
         await session.flush()
         return True
 

@@ -4,6 +4,12 @@ from app.domain.models.audit_report import AuditReport, AuditReportStatus
 from app.domain.models.counterparty import Counterparty
 from app.domain.models.debt_position import DebtPosition
 from app.domain.models.manager_group import ManagerGroup
+from app.domain.models.report_delivery import (
+    ReportDelivery,
+    ReportDeliveryChannel,
+    ReportDeliveryKind,
+    ReportDeliveryStatus,
+)
 from app.domain.models.source_file import (
     SourceFile,
     SourceFileLifecycle,
@@ -20,6 +26,10 @@ __all__ = [
     "Counterparty",
     "DebtPosition",
     "ManagerGroup",
+    "ReportDelivery",
+    "ReportDeliveryChannel",
+    "ReportDeliveryKind",
+    "ReportDeliveryStatus",
     "SourceFile",
     "SourceFileLifecycle",
     "SourceFileStatus",

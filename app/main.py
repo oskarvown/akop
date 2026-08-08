@@ -19,6 +19,7 @@ from app.bot.handlers import get_root_router
 from app.bot.middlewares.allowlist import AllowlistMiddleware
 from app.bot.middlewares.database import DatabaseSessionMiddleware
 from app.bot.scheduler.idle_scheduler import IdleReminderScheduler
+from app.bot.scheduler.report_scheduler import ReportScheduler
 from app.config import get_settings
 from app.infrastructure.database.session import get_session_maker
 
@@ -71,6 +72,11 @@ async def main() -> None:
         session_maker=session_maker,
         settings=settings,
     )
+    report_scheduler = ReportScheduler(
+        bot=bot,
+        session_maker=session_maker,
+        settings=settings,
+    )
 
     logger.info(
         "Дебиторка-бот запускается (allowed_user_ids=%s, notify_chat_id=%s)",
@@ -78,9 +84,11 @@ async def main() -> None:
         settings.audit_notification_chat_id,
     )
     await scheduler.start()
+    await report_scheduler.start()
     try:
         await dispatcher.start_polling(bot)
     finally:
+        await report_scheduler.stop()
         await scheduler.stop()
         await bot.session.close()
 

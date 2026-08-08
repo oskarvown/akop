@@ -22,6 +22,12 @@ _REQUIRED_ENV_VARS = (
     "REPORT_BUILD_MAX_ATTEMPTS",
     "REPORT_BUILD_BACKOFF_SECONDS",
     "REPORT_SCHEDULER_POLL_SECONDS",
+    "REPORT_DELIVERY_CLAIM_TTL_SECONDS",
+    "REPORT_DELIVERY_SEND_TIMEOUT_SECONDS",
+    "REPORT_DELIVERY_MAX_ATTEMPTS",
+    "REPORT_DELIVERY_BACKOFF_SECONDS",
+    "REPORT_DELIVERY_MAX_FILE_BYTES",
+    "REPORT_DELIVERY_BATCH_SIZE",
 )
 
 _STAGE32_DEFAULTS = {
@@ -37,6 +43,12 @@ _STAGE32_DEFAULTS = {
     "REPORT_BUILD_MAX_ATTEMPTS": "5",
     "REPORT_BUILD_BACKOFF_SECONDS": "60",
     "REPORT_SCHEDULER_POLL_SECONDS": "30",
+    "REPORT_DELIVERY_CLAIM_TTL_SECONDS": "300",
+    "REPORT_DELIVERY_SEND_TIMEOUT_SECONDS": "30",
+    "REPORT_DELIVERY_MAX_ATTEMPTS": "5",
+    "REPORT_DELIVERY_BACKOFF_SECONDS": "60",
+    "REPORT_DELIVERY_MAX_FILE_BYTES": "52428800",
+    "REPORT_DELIVERY_BATCH_SIZE": "10",
 }
 
 
@@ -88,6 +100,27 @@ def test_settings_rejects_send_timeout_not_less_than_claim_ttl(
 
     with pytest.raises(ValueError, match="SEND_TIMEOUT"):
         Settings(_env_file=None)  # type: ignore[call-arg]
+
+
+def test_settings_rejects_delivery_send_timeout_not_less_than_claim_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_base_env(monkeypatch)
+    monkeypatch.setenv("REPORT_DELIVERY_SEND_TIMEOUT_SECONDS", "300")
+    monkeypatch.setenv("REPORT_DELIVERY_CLAIM_TTL_SECONDS", "300")
+
+    with pytest.raises(ValueError, match="REPORT_DELIVERY_SEND_TIMEOUT"):
+        Settings(_env_file=None)  # type: ignore[call-arg]
+
+
+def test_settings_reads_delivery_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_base_env(monkeypatch)
+    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert settings.report_delivery_batch_size == 10
+    assert settings.report_delivery_max_file_bytes == 52428800
+    assert settings.report_delivery_send_timeout_seconds < (
+        settings.report_delivery_claim_ttl_seconds
+    )
 
 
 def test_missing_required_env_vars_raise_configuration_error(

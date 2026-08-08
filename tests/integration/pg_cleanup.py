@@ -11,6 +11,7 @@ from app.domain.models import (
     Counterparty,
     DebtPosition,
     ManagerGroup,
+    ReportDelivery,
     SourceFile,
 )
 from tests.integration.db_safety import assert_destructive_cleanup_allowed
@@ -24,6 +25,7 @@ async def clean_stage3_tables(
     """DELETE всех Stage 3/4 строк; только после ``assert_destructive_cleanup_allowed``."""
     assert_destructive_cleanup_allowed(db_name)
     async with maker() as session:
+        await session.execute(delete(ReportDelivery))
         await session.execute(delete(AuditArtifact))
         await session.execute(delete(AuditReport))
         await session.execute(delete(DebtPosition))

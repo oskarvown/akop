@@ -85,6 +85,26 @@ class Settings(BaseSettings):
         ..., alias="REPORT_SCHEDULER_POLL_SECONDS"
     )
 
+    # Stage 4.3 Telegram delivery claim / retry
+    report_delivery_claim_ttl_seconds: int = Field(
+        ..., alias="REPORT_DELIVERY_CLAIM_TTL_SECONDS"
+    )
+    report_delivery_send_timeout_seconds: int = Field(
+        ..., alias="REPORT_DELIVERY_SEND_TIMEOUT_SECONDS"
+    )
+    report_delivery_max_attempts: int = Field(
+        ..., alias="REPORT_DELIVERY_MAX_ATTEMPTS"
+    )
+    report_delivery_backoff_seconds: int = Field(
+        ..., alias="REPORT_DELIVERY_BACKOFF_SECONDS"
+    )
+    report_delivery_max_file_bytes: int = Field(
+        ..., alias="REPORT_DELIVERY_MAX_FILE_BYTES"
+    )
+    report_delivery_batch_size: int = Field(
+        ..., alias="REPORT_DELIVERY_BATCH_SIZE"
+    )
+
     # LLM fallback (Roadmap §6.1, провайдер не выбран — Stage 6)
     llm_api_key: str | None = Field(None, alias="LLM_API_KEY")
     llm_model: str | None = Field(None, alias="LLM_MODEL")
@@ -108,6 +128,11 @@ class Settings(BaseSettings):
         "report_build_claim_ttl_seconds",
         "report_build_backoff_seconds",
         "report_scheduler_poll_seconds",
+        "report_delivery_claim_ttl_seconds",
+        "report_delivery_send_timeout_seconds",
+        "report_delivery_backoff_seconds",
+        "report_delivery_max_file_bytes",
+        "report_delivery_batch_size",
         "max_upload_size_bytes",
     )
     @classmethod
@@ -116,7 +141,11 @@ class Settings(BaseSettings):
             raise ValueError("value must be positive")
         return value
 
-    @field_validator("audit_max_reminders", "report_build_max_attempts")
+    @field_validator(
+        "audit_max_reminders",
+        "report_build_max_attempts",
+        "report_delivery_max_attempts",
+    )
     @classmethod
     def _max_reminders_at_least_one(cls, value: int) -> int:
         if value < 1:
@@ -146,6 +175,14 @@ class Settings(BaseSettings):
             raise ValueError(
                 "AUDIT_REMINDER_SEND_TIMEOUT_SECONDS must be strictly less than "
                 "AUDIT_REMINDER_CLAIM_TTL_SECONDS"
+            )
+        if (
+            self.report_delivery_send_timeout_seconds
+            >= self.report_delivery_claim_ttl_seconds
+        ):
+            raise ValueError(
+                "REPORT_DELIVERY_SEND_TIMEOUT_SECONDS must be strictly less than "
+                "REPORT_DELIVERY_CLAIM_TTL_SECONDS"
             )
         return self
 

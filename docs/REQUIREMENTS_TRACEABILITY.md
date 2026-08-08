@@ -100,7 +100,10 @@
 |---|---|---|
 | Агрегация: общий итог → отдел → ManagerGroup → контрагент → договор → документ | `tests/unit/application/test_report_aggregation_levels.py` | `app/application/report_service.py` |
 | Разбиение длинного отчёта на сообщения Telegram | `tests/unit/application/test_report_message_splitting.py` | `app/application/report_service.py` |
-| Формулировка «чистое снижение долга», не «оплата» | `tests/unit/application/test_report_wording_net_reduction.py` | `app/application/report_service.py` |
+| Формулировка «чистое снижение долга», не «оплата» | `tests/unit/test_report_delivery.py` | `app/application/report_delivery_service.py` |
+| Telegram delivery CORE + `/report` (Stage 4.3) | `tests/integration/test_stage43_delivery.py`; `tests/unit/test_report_delivery.py` | `app/application/report_delivery_service.py`; `app/bot/scheduler/report_scheduler.py`; `app/bot/handlers/report.py` |
+| Один automatic lifecycle; unlimited manual; at-least-once | `tests/integration/test_stage43_delivery.py` | `app/domain/models/report_delivery.py` |
+| ENRICHED generation / OpenRouter | — (Stage 4.4, не реализовано) | — |
 
 ## Безопасность и эксплуатация (Roadmap §7 чек-лист, §8 тесты)
 

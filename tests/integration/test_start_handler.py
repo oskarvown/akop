@@ -95,6 +95,12 @@ async def test_start_available_to_allowed_user_in_private_chat() -> None:
     assert any(isinstance(method, SendMessage) for method in sent), (
         "Ожидался ответ /start-хендлера разрешённому пользователю в private chat"
     )
+    start_texts = [
+        method.text
+        for method in sent
+        if isinstance(method, SendMessage) and method.text
+    ]
+    assert any("/report" in text for text in start_texts)
 
 
 @pytest.mark.asyncio

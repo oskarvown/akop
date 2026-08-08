@@ -8,6 +8,7 @@ async def handle_start(message: Message) -> None:
     await message.answer(
         "Дебиторка-бот запущен.\n"
         "Отправьте Excel-файл для недельного аудита или используйте /status.\n"
+        "Готовый отчёт: /report (или /report core, /report YYYY-MM-DD).\n"
         "После сохранения в открытый сбор можно отменить последнюю загрузку "
         "кнопкой или /undo (с подтверждением)."
     )

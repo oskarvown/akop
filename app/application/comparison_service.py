@@ -635,25 +635,121 @@ class ComparisonSummary:
 
     previous_cycle_id: int | None
     previous_report_date: str | None
+    current_report_date: str
     entity_count: int
     ambiguous_key_count: int
     collision_count: int
     overdue_profile_change_count: int
+    new_count: int
+    closed_count: int
     control_failures: list[str] = field(default_factory=list)
+    company_metrics: dict[str, dict[str, object | None]] = field(default_factory=dict)
+    total_overdue: dict[str, object | None] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, object]:
         return {
             "previous_cycle_id": self.previous_cycle_id,
             "previous_report_date": self.previous_report_date,
+            "current_report_date": self.current_report_date,
             "entity_count": self.entity_count,
             "ambiguous_key_count": self.ambiguous_key_count,
             "collision_count": self.collision_count,
             "overdue_profile_change_count": self.overdue_profile_change_count,
+            "new_count": self.new_count,
+            "closed_count": self.closed_count,
             "control_failures": self.control_failures,
+            "company_metrics": self.company_metrics,
+            "total_overdue": self.total_overdue,
         }
 
 
+def _metric_delta_payload(delta: MetricDelta) -> dict[str, object | None]:
+    return {
+        "current": str(delta.current) if delta.current is not None else None,
+        "previous": str(delta.previous) if delta.previous is not None else None,
+        "abs_delta": str(delta.abs_delta) if delta.abs_delta is not None else None,
+        "percent_delta": (
+            str(delta.percent_delta) if delta.percent_delta is not None else None
+        ),
+    }
+
+
+def _company_metric_deltas(
+    comparison: CycleComparison,
+) -> dict[str, MetricDelta]:
+    curr_l1 = [p for p in comparison.current_positions if p.outline_level == 1]
+    prev_l1 = [p for p in comparison.previous_positions if p.outline_level == 1]
+    curr_present = bool(curr_l1)
+    prev_present = bool(prev_l1)
+    out: dict[str, MetricDelta] = {}
+    for metric in ADDITIVE_METRICS:
+        curr_m = _sum_metrics(curr_l1, metric)
+        prev_m = _sum_metrics(prev_l1, metric)
+        ad = abs_delta(
+            curr_present=curr_present,
+            prev_present=prev_present,
+            curr_m=curr_m,
+            prev_m=prev_m,
+        )
+        out[metric] = MetricDelta(
+            current=curr_m if curr_present else None,
+            previous=prev_m if prev_present else None,
+            abs_delta=ad,
+            percent_delta=percent_delta(ad, prev_m if prev_present else None),
+        )
+    return out
+
+
+def _sum_l1_overdue(positions: Sequence[PositionSnapshot]) -> Decimal | None:
+    total = Decimal("0")
+    any_value = False
+    for pos in positions:
+        if pos.outline_level != 1:
+            continue
+        for bucket in OVERDUE_BUCKETS:
+            value = pos.metrics.get(bucket)
+            if value is None:
+                continue
+            total += value
+            any_value = True
+    return total if any_value else None
+
+
 def summarize_comparison(comparison: CycleComparison) -> ComparisonSummary:
+    company = _company_metric_deltas(comparison)
+    company_metrics = {
+        name: _metric_delta_payload(company[name]) for name in ADDITIVE_METRICS
+    }
+
+    curr_od = _sum_l1_overdue(comparison.current_positions)
+    prev_od = _sum_l1_overdue(comparison.previous_positions)
+    curr_present = any(p.outline_level == 1 for p in comparison.current_positions)
+    prev_present = any(p.outline_level == 1 for p in comparison.previous_positions)
+    od_abs = abs_delta(
+        curr_present=curr_present,
+        prev_present=prev_present,
+        curr_m=curr_od,
+        prev_m=prev_od,
+    )
+    od_pct = percent_delta(od_abs, prev_od if prev_present else None)
+    total_overdue = {
+        "current": str(curr_od) if curr_od is not None else None,
+        "previous": str(prev_od) if prev_od is not None else None,
+        "abs_delta": str(od_abs) if od_abs is not None else None,
+        "percent_delta": str(od_pct) if od_pct is not None else None,
+    }
+
+    new_count = sum(
+        1
+        for e in comparison.entities
+        if not e.ambiguous and e.current is not None and e.previous is None
+    )
+    closed_count = sum(
+        1
+        for e in comparison.entities
+        if not e.ambiguous and e.current is None and e.previous is not None
+    )
+
     return ComparisonSummary(
         previous_cycle_id=comparison.previous_cycle_id,
         previous_report_date=(
@@ -661,13 +757,18 @@ def summarize_comparison(comparison: CycleComparison) -> ComparisonSummary:
             if comparison.previous_report_date
             else None
         ),
+        current_report_date=comparison.current_report_date.isoformat(),
         entity_count=len(comparison.entities),
         ambiguous_key_count=len(comparison.ambiguous_keys),
         collision_count=len(comparison.collisions),
         overdue_profile_change_count=sum(
             1 for e in comparison.entities if e.overdue_profile_changed
         ),
+        new_count=new_count,
+        closed_count=closed_count,
         control_failures=[
             c.name for c in comparison.control_equalities if not c.ok and not c.diagnostic
         ],
+        company_metrics=company_metrics,
+        total_overdue=total_overdue,
     )
