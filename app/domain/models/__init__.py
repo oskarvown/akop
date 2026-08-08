@@ -1,3 +1,4 @@
+from app.domain.models.audit_artifact import AuditArtifact, AuditArtifactKind
 from app.domain.models.audit_cycle import AuditCycle, AuditCycleStatus
 from app.domain.models.audit_report import AuditReport, AuditReportStatus
 from app.domain.models.counterparty import Counterparty
@@ -10,6 +11,8 @@ from app.domain.models.source_file import (
 )
 
 __all__ = [
+    "AuditArtifact",
+    "AuditArtifactKind",
     "AuditCycle",
     "AuditCycleStatus",
     "AuditReport",

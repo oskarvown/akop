@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import hashlib
 import uuid
 from dataclasses import replace
 from pathlib import Path
@@ -232,13 +233,15 @@ async def test_build_claim_single_winner_and_complete(
     assert claim_b is None
 
     async with stage3_session_maker() as session:
-        summary = await run_claimed_build(session, claim=claim_a)
+        result = await run_claimed_build(session, claim=claim_a)
     async with stage3_session_maker() as session:
         ok = await complete_report_build(
             session,
             report_id=report_id,
             claim_token=claim_a.claim_token,
-            summary_json=summary,
+            summary_json=result.summary_json,
+            excel_bytes=result.excel_bytes,
+            excel_sha256=result.excel_sha256,
         )
         assert ok is True
     async with stage3_session_maker() as session:
@@ -247,6 +250,17 @@ async def test_build_claim_single_winner_and_complete(
         assert report.status == AuditReportStatus.READY
         assert report.summary_json is not None
         assert report.build_claim_token is None
+        from app.domain.models import AuditArtifact, AuditArtifactKind
+
+        artifact = await session.scalar(
+            select(AuditArtifact).where(
+                AuditArtifact.audit_report_id == report_id,
+                AuditArtifact.kind == AuditArtifactKind.CORE,
+            )
+        )
+        assert artifact is not None
+        assert artifact.excel_sha256 == result.excel_sha256
+        assert artifact.financial_input_hash == report.input_hash
 
 
 @pytest.mark.asyncio
@@ -452,12 +466,16 @@ async def test_complete_rejects_wrong_token(
             session, report_id=report_id, settings=_settings()
         )
     assert claim is not None
+    excel_bytes = b"PK\x03\x04not-a-real-xlsx-but-enough"
+    excel_sha = hashlib.sha256(excel_bytes).hexdigest()
     async with stage3_session_maker() as session:
         ok = await complete_report_build(
             session,
             report_id=report_id,
             claim_token=uuid.uuid4(),
             summary_json={"x": 1},
+            excel_bytes=excel_bytes,
+            excel_sha256=excel_sha,
         )
     assert ok is False
 

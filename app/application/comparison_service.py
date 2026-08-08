@@ -16,7 +16,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.domain.models import (
     AuditCycle,
     AuditCycleStatus,
+    Counterparty,
     DebtPosition,
+    ManagerGroup,
     SourceFile,
     SourceFileLifecycle,
 )
@@ -65,6 +67,9 @@ class PositionSnapshot:
     department: str
     metrics: dict[str, Decimal | None]
     credit_limit: Decimal | None
+    parent_position_id: int | None = None
+    manager_group_name: str = ""
+    counterparty_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -218,7 +223,11 @@ def _sum_metrics(
 
 
 def _snapshot_from_row(
-    row: DebtPosition, *, department: str
+    row: DebtPosition,
+    *,
+    department: str,
+    manager_group_name: str = "",
+    counterparty_name: str = "",
 ) -> PositionSnapshot:
     metrics = {name: getattr(row, name) for name in ADDITIVE_METRICS}
     return PositionSnapshot(
@@ -233,6 +242,9 @@ def _snapshot_from_row(
         department=department,
         metrics=metrics,
         credit_limit=row.credit_limit,
+        parent_position_id=row.parent_position_id,
+        manager_group_name=manager_group_name,
+        counterparty_name=counterparty_name,
     )
 
 
@@ -257,8 +269,15 @@ async def load_active_positions(
 ) -> list[PositionSnapshot]:
     rows = (
         await session.execute(
-            select(DebtPosition, SourceFile.department)
+            select(
+                DebtPosition,
+                SourceFile.department,
+                ManagerGroup.raw_name,
+                Counterparty.raw_name,
+            )
             .join(SourceFile, DebtPosition.source_file_id == SourceFile.id)
+            .join(ManagerGroup, DebtPosition.manager_group_id == ManagerGroup.id)
+            .join(Counterparty, DebtPosition.counterparty_id == Counterparty.id)
             .where(
                 SourceFile.audit_cycle_id == cycle_id,
                 SourceFile.lifecycle_status == SourceFileLifecycle.ACTIVE,
@@ -267,8 +286,13 @@ async def load_active_positions(
         )
     ).all()
     return [
-        _snapshot_from_row(position, department=department.value)
-        for position, department in rows
+        _snapshot_from_row(
+            position,
+            department=department.value,
+            manager_group_name=mg_name,
+            counterparty_name=cp_name,
+        )
+        for position, department, mg_name, cp_name in rows
     ]
 
 

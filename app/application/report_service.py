@@ -1,7 +1,7 @@
-"""AuditReport enqueue, recovery, and build-claim orchestration (Stage 4.1).
+"""AuditReport enqueue, recovery, build-claim, and CORE artifact completion (Stage 4.2).
 
-Excel / AuditArtifact generation is Stage 4.2. Stage 4.1 completes a build by
-running comparison_service and storing summary_json + READY (no workbook yet).
+Excel generation runs outside the claim lock. Success writes AuditArtifact(CORE)
++ summary_json + READY in one transaction — READY without CORE is forbidden.
 """
 from __future__ import annotations
 
@@ -20,7 +20,10 @@ from app.application.comparison_service import (
     find_previous_completed_cycle,
     summarize_comparison,
 )
+from app.application.report_workbook import build_core_excel_bytes
 from app.domain.models import (
+    AuditArtifact,
+    AuditArtifactKind,
     AuditCycle,
     AuditCycleStatus,
     AuditReport,
@@ -31,7 +34,7 @@ from app.domain.models import (
 
 logger = logging.getLogger(__name__)
 
-GENERATOR_VERSION = "stage4.1.0"
+GENERATOR_VERSION = "stage4.2.0"
 SCHEMA_VERSION = "stage4.v1"
 
 
@@ -49,6 +52,13 @@ class BuildClaim:
     audit_cycle_id: int
     claim_token: uuid.UUID
     attempt_count: int
+
+
+@dataclass(frozen=True)
+class BuildResult:
+    summary_json: dict[str, Any]
+    excel_bytes: bytes
+    excel_sha256: str
 
 
 def _ensure_utc(value: dt.datetime) -> dt.datetime:
@@ -360,7 +370,6 @@ async def fail_report_build(
         if report.build_attempt_count >= max_attempts:
             report.next_retry_at = None
         else:
-            # Exponential-ish: backoff * attempt_count, capped later by scheduler.
             delay = backoff * max(1, int(report.build_attempt_count))
             report.next_retry_at = now + dt.timedelta(seconds=delay)
         await session.flush()
@@ -373,8 +382,19 @@ async def complete_report_build(
     report_id: int,
     claim_token: uuid.UUID,
     summary_json: dict[str, Any],
+    excel_bytes: bytes,
+    excel_sha256: str,
 ) -> bool:
-    """Mark READY after comparison (Stage 4.1). Artifact bytes arrive in 4.2."""
+    """Atomically store CORE artifact + summary and mark READY.
+
+    READY without a CORE artifact is forbidden.
+    """
+    if not excel_bytes:
+        raise ReportServiceError("CORE excel_bytes required for READY")
+    expected = hashlib.sha256(excel_bytes).hexdigest()
+    if excel_sha256 != expected:
+        raise ReportServiceError("excel_sha256 does not match excel_bytes")
+
     async with session.begin():
         report = await session.scalar(
             select(AuditReport).where(AuditReport.id == report_id).with_for_update()
@@ -384,6 +404,29 @@ async def complete_report_build(
         if report.status != AuditReportStatus.BUILDING:
             return False
 
+        existing_core = await session.scalar(
+            select(AuditArtifact.id).where(
+                AuditArtifact.audit_report_id == report_id,
+                AuditArtifact.kind == AuditArtifactKind.CORE,
+                AuditArtifact.revision == 1,
+            )
+        )
+        if existing_core is not None:
+            raise ReportServiceError("CORE artifact already exists for report")
+
+        session.add(
+            AuditArtifact(
+                audit_report_id=report.id,
+                kind=AuditArtifactKind.CORE,
+                revision=1,
+                excel_bytes=excel_bytes,
+                excel_sha256=excel_sha256,
+                financial_input_hash=report.input_hash,
+                enrichment_input_hash=None,
+                generator_version=report.generator_version,
+                schema_version=report.schema_version,
+            )
+        )
         report.status = AuditReportStatus.READY
         report.summary_json = summary_json
         report.built_at = func.clock_timestamp()
@@ -399,15 +442,14 @@ async def run_claimed_build(
     session: AsyncSession,
     *,
     claim: BuildClaim,
-) -> dict[str, Any]:
-    """Generate comparison summary for a claimed build (no Excel)."""
+) -> BuildResult:
+    """Compare cycles and build CORE Excel bytes for a claimed report."""
     async with session.begin():
         report = await session.scalar(
             select(AuditReport).where(AuditReport.id == claim.report_id)
         )
         if report is None or report.build_claim_token != claim.claim_token:
             raise ReportBuildClaimError("claim token mismatch before generate")
-        # Freeze previous_cycle_id: use stored value, do not recompute.
         cycle = await session.scalar(
             select(AuditCycle).where(AuditCycle.id == report.audit_cycle_id)
         )
@@ -427,4 +469,11 @@ async def run_claimed_build(
         summary["generator_version"] = report.generator_version
         summary["schema_version"] = report.schema_version
         summary["input_hash"] = report.input_hash
-        return summary
+
+        excel_bytes, excel_sha256 = build_core_excel_bytes(comparison)
+        summary["excel_sha256"] = excel_sha256
+        return BuildResult(
+            summary_json=summary,
+            excel_bytes=excel_bytes,
+            excel_sha256=excel_sha256,
+        )

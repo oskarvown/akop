@@ -5,6 +5,7 @@ from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.domain.models import (
+    AuditArtifact,
     AuditCycle,
     AuditReport,
     Counterparty,
@@ -23,6 +24,7 @@ async def clean_stage3_tables(
     """DELETE всех Stage 3/4 строк; только после ``assert_destructive_cleanup_allowed``."""
     assert_destructive_cleanup_allowed(db_name)
     async with maker() as session:
+        await session.execute(delete(AuditArtifact))
         await session.execute(delete(AuditReport))
         await session.execute(delete(DebtPosition))
         await session.execute(delete(SourceFile))
