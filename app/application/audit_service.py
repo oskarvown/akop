@@ -289,6 +289,10 @@ async def finalize_if_complete(
     if cycle.status == AuditCycleStatus.COLLECTING and summary.is_complete:
         cycle.status = AuditCycleStatus.COMPLETED
         cycle.completed_at = func.clock_timestamp()
+        # Stage 4.1: AuditReport(PENDING) in the same transaction as COMPLETED.
+        from app.application.report_service import enqueue_pending_report
+
+        await enqueue_pending_report(session, cycle)
         return summary, True
     return summary, False
 

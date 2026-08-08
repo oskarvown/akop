@@ -1,4 +1,5 @@
 from app.domain.models.audit_cycle import AuditCycle, AuditCycleStatus
+from app.domain.models.audit_report import AuditReport, AuditReportStatus
 from app.domain.models.counterparty import Counterparty
 from app.domain.models.debt_position import DebtPosition
 from app.domain.models.manager_group import ManagerGroup
@@ -11,6 +12,8 @@ from app.domain.models.source_file import (
 __all__ = [
     "AuditCycle",
     "AuditCycleStatus",
+    "AuditReport",
+    "AuditReportStatus",
     "Counterparty",
     "DebtPosition",
     "ManagerGroup",

@@ -49,6 +49,10 @@ class DebtPosition(Base):
     outline_level: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     row_order: Mapped[int] = mapped_column(Integer, nullable=False)
     raw_label: Mapped[str] = mapped_column(Text, nullable=False)
+    # Stage 4.1 — cross-cycle matching (row_order is never identity)
+    normalized_label: Mapped[str] = mapped_column(Text, nullable=False)
+    match_key: Mapped[str] = mapped_column(Text, nullable=False)
+    match_key_hash: Mapped[str] = mapped_column(Text, nullable=False)
 
     payment_deferral_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
     payment_deferral_error: Mapped[str | None] = mapped_column(Text, nullable=True)

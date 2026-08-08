@@ -73,6 +73,18 @@ class Settings(BaseSettings):
         ..., alias="AUDIT_REMINDER_ERROR_BACKOFF_SECONDS"
     )
 
+    # Stage 4.1 report build claim / retry
+    report_build_claim_ttl_seconds: int = Field(
+        ..., alias="REPORT_BUILD_CLAIM_TTL_SECONDS"
+    )
+    report_build_max_attempts: int = Field(..., alias="REPORT_BUILD_MAX_ATTEMPTS")
+    report_build_backoff_seconds: int = Field(
+        ..., alias="REPORT_BUILD_BACKOFF_SECONDS"
+    )
+    report_scheduler_poll_seconds: int = Field(
+        ..., alias="REPORT_SCHEDULER_POLL_SECONDS"
+    )
+
     # LLM fallback (Roadmap §6.1, провайдер не выбран — Stage 6)
     llm_api_key: str | None = Field(None, alias="LLM_API_KEY")
     llm_model: str | None = Field(None, alias="LLM_MODEL")
@@ -93,6 +105,9 @@ class Settings(BaseSettings):
         "audit_reminder_claim_ttl_seconds",
         "audit_reminder_send_timeout_seconds",
         "audit_reminder_error_backoff_seconds",
+        "report_build_claim_ttl_seconds",
+        "report_build_backoff_seconds",
+        "report_scheduler_poll_seconds",
         "max_upload_size_bytes",
     )
     @classmethod
@@ -101,11 +116,11 @@ class Settings(BaseSettings):
             raise ValueError("value must be positive")
         return value
 
-    @field_validator("audit_max_reminders")
+    @field_validator("audit_max_reminders", "report_build_max_attempts")
     @classmethod
     def _max_reminders_at_least_one(cls, value: int) -> int:
         if value < 1:
-            raise ValueError("AUDIT_MAX_REMINDERS must be >= 1")
+            raise ValueError("value must be >= 1")
         return value
 
     @field_validator("audit_expire_grace_seconds")

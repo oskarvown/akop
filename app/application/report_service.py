@@ -1,0 +1,348 @@
+"""AuditReport enqueue, recovery, and build-claim orchestration (Stage 4.1).
+
+Excel / AuditArtifact generation is Stage 4.2. Stage 4.1 completes a build by
+running comparison_service and storing summary_json + READY (no workbook yet).
+"""
+from __future__ import annotations
+
+import datetime as dt
+import hashlib
+import logging
+import uuid
+from dataclasses import dataclass
+from typing import Any
+
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.application.comparison_service import (
+    compare_cycles,
+    find_previous_completed_cycle,
+    summarize_comparison,
+)
+from app.domain.models import (
+    AuditCycle,
+    AuditCycleStatus,
+    AuditReport,
+    AuditReportStatus,
+    SourceFile,
+    SourceFileLifecycle,
+)
+
+logger = logging.getLogger(__name__)
+
+GENERATOR_VERSION = "stage4.1.0"
+SCHEMA_VERSION = "stage4.v1"
+
+
+class ReportServiceError(RuntimeError):
+    pass
+
+
+class ReportBuildClaimError(ReportServiceError):
+    pass
+
+
+@dataclass(frozen=True)
+class BuildClaim:
+    report_id: int
+    audit_cycle_id: int
+    claim_token: uuid.UUID
+    attempt_count: int
+
+
+def _ensure_utc(value: dt.datetime) -> dt.datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=dt.timezone.utc)
+    return value.astimezone(dt.timezone.utc)
+
+
+def _claim_is_active(
+    *,
+    token: uuid.UUID | None,
+    claimed_at: dt.datetime | None,
+    now_utc: dt.datetime,
+    claim_ttl_seconds: int,
+) -> bool:
+    if token is None or claimed_at is None:
+        return False
+    age = (now_utc - _ensure_utc(claimed_at)).total_seconds()
+    return age < claim_ttl_seconds
+
+
+def compute_input_hash(
+    *,
+    cycle_id: int,
+    previous_cycle_id: int | None,
+    active_files: list[tuple[int, str]],
+    generator_version: str = GENERATOR_VERSION,
+    schema_version: str = SCHEMA_VERSION,
+) -> str:
+    parts = [
+        f"cycle:{cycle_id}",
+        f"previous:{previous_cycle_id if previous_cycle_id is not None else 'none'}",
+        f"generator:{generator_version}",
+        f"schema:{schema_version}",
+    ]
+    for file_id, sha256 in sorted(active_files, key=lambda item: item[0]):
+        parts.append(f"file:{file_id}:{sha256}")
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+
+async def _active_file_fingerprints(
+    session: AsyncSession, cycle_id: int
+) -> list[tuple[int, str]]:
+    rows = (
+        await session.execute(
+            select(SourceFile.id, SourceFile.sha256).where(
+                SourceFile.audit_cycle_id == cycle_id,
+                SourceFile.lifecycle_status == SourceFileLifecycle.ACTIVE,
+            )
+        )
+    ).all()
+    return [(int(file_id), str(sha256)) for file_id, sha256 in rows]
+
+
+async def enqueue_pending_report(
+    session: AsyncSession,
+    cycle: AuditCycle,
+) -> AuditReport:
+    """Insert AuditReport(PENDING) for a just-COMPLETED cycle (same txn).
+
+    Idempotent: returns existing row if already present.
+    """
+    existing = await session.scalar(
+        select(AuditReport).where(AuditReport.audit_cycle_id == cycle.id)
+    )
+    if existing is not None:
+        return existing
+
+    previous = await find_previous_completed_cycle(
+        session, current_report_date=cycle.report_date
+    )
+    previous_id = previous.id if previous is not None else None
+    files = await _active_file_fingerprints(session, cycle.id)
+    input_hash = compute_input_hash(
+        cycle_id=cycle.id,
+        previous_cycle_id=previous_id,
+        active_files=files,
+    )
+    report = AuditReport(
+        audit_cycle_id=cycle.id,
+        previous_cycle_id=previous_id,
+        status=AuditReportStatus.PENDING,
+        generator_version=GENERATOR_VERSION,
+        schema_version=SCHEMA_VERSION,
+        input_hash=input_hash,
+    )
+    session.add(report)
+    await session.flush()
+    return report
+
+
+async def recover_missing_reports(session: AsyncSession) -> list[int]:
+    """Defense in depth: COMPLETED cycles without AuditReport → insert PENDING."""
+    created: list[int] = []
+    async with session.begin():
+        cycles = (
+            await session.execute(
+                select(AuditCycle)
+                .where(AuditCycle.status == AuditCycleStatus.COMPLETED)
+                .order_by(AuditCycle.id)
+            )
+        ).scalars().all()
+        for cycle in cycles:
+            existing = await session.scalar(
+                select(AuditReport.id).where(AuditReport.audit_cycle_id == cycle.id)
+            )
+            if existing is not None:
+                continue
+            report = await enqueue_pending_report(session, cycle)
+            created.append(report.id)
+    return created
+
+
+async def list_buildable_report_ids(session: AsyncSession) -> list[int]:
+    async with session.begin():
+        rows = (
+            await session.execute(
+                select(AuditReport.id)
+                .where(
+                    AuditReport.status.in_(
+                        (AuditReportStatus.PENDING, AuditReportStatus.FAILED)
+                    )
+                )
+                .order_by(AuditReport.id)
+            )
+        ).scalars().all()
+        return list(rows)
+
+
+async def claim_report_build(
+    session: AsyncSession,
+    *,
+    report_id: int,
+    settings: object,
+    now_utc: dt.datetime | None = None,
+) -> BuildClaim | None:
+    """Atomic PENDING/FAILED → BUILDING. Commit before generation."""
+    now = _ensure_utc(now_utc or dt.datetime.now(dt.timezone.utc))
+    claim_ttl = int(settings.report_build_claim_ttl_seconds)  # type: ignore[attr-defined]
+    max_attempts = int(settings.report_build_max_attempts)  # type: ignore[attr-defined]
+
+    async with session.begin():
+        report = await session.scalar(
+            select(AuditReport).where(AuditReport.id == report_id).with_for_update()
+        )
+        if report is None:
+            return None
+        if report.status not in (
+            AuditReportStatus.PENDING,
+            AuditReportStatus.FAILED,
+        ):
+            # Stale BUILDING past TTL → reclaim as FAILED then allow next tick.
+            if (
+                report.status == AuditReportStatus.BUILDING
+                and not _claim_is_active(
+                    token=report.build_claim_token,
+                    claimed_at=report.build_claimed_at,
+                    now_utc=now,
+                    claim_ttl_seconds=claim_ttl,
+                )
+            ):
+                report.status = AuditReportStatus.FAILED
+                report.last_build_error = "build_claim_ttl_expired"
+                report.build_claim_token = None
+                report.build_claimed_at = None
+                report.next_retry_at = now
+                await session.flush()
+            return None
+
+        if report.status == AuditReportStatus.FAILED:
+            if report.build_attempt_count >= max_attempts:
+                return None
+            if report.next_retry_at is not None and _ensure_utc(
+                report.next_retry_at
+            ) > now:
+                return None
+
+        if _claim_is_active(
+            token=report.build_claim_token,
+            claimed_at=report.build_claimed_at,
+            now_utc=now,
+            claim_ttl_seconds=claim_ttl,
+        ):
+            return None
+
+        token = uuid.uuid4()
+        report.status = AuditReportStatus.BUILDING
+        report.build_claim_token = token
+        report.build_claimed_at = func.clock_timestamp()
+        report.build_attempt_count = int(report.build_attempt_count) + 1
+        report.next_retry_at = None
+        await session.flush()
+        return BuildClaim(
+            report_id=report.id,
+            audit_cycle_id=report.audit_cycle_id,
+            claim_token=token,
+            attempt_count=report.build_attempt_count,
+        )
+
+
+async def fail_report_build(
+    session: AsyncSession,
+    *,
+    report_id: int,
+    claim_token: uuid.UUID,
+    error: str,
+    settings: object,
+    now_utc: dt.datetime | None = None,
+) -> bool:
+    now = _ensure_utc(now_utc or dt.datetime.now(dt.timezone.utc))
+    backoff = int(settings.report_build_backoff_seconds)  # type: ignore[attr-defined]
+    max_attempts = int(settings.report_build_max_attempts)  # type: ignore[attr-defined]
+
+    async with session.begin():
+        report = await session.scalar(
+            select(AuditReport).where(AuditReport.id == report_id).with_for_update()
+        )
+        if report is None or report.build_claim_token != claim_token:
+            return False
+        if report.status != AuditReportStatus.BUILDING:
+            return False
+
+        report.status = AuditReportStatus.FAILED
+        report.last_build_error = error[:2000]
+        report.build_claim_token = None
+        report.build_claimed_at = None
+        if report.build_attempt_count >= max_attempts:
+            report.next_retry_at = None
+        else:
+            # Exponential-ish: backoff * attempt_count, capped later by scheduler.
+            delay = backoff * max(1, int(report.build_attempt_count))
+            report.next_retry_at = now + dt.timedelta(seconds=delay)
+        await session.flush()
+        return True
+
+
+async def complete_report_build(
+    session: AsyncSession,
+    *,
+    report_id: int,
+    claim_token: uuid.UUID,
+    summary_json: dict[str, Any],
+) -> bool:
+    """Mark READY after comparison (Stage 4.1). Artifact bytes arrive in 4.2."""
+    async with session.begin():
+        report = await session.scalar(
+            select(AuditReport).where(AuditReport.id == report_id).with_for_update()
+        )
+        if report is None or report.build_claim_token != claim_token:
+            return False
+        if report.status != AuditReportStatus.BUILDING:
+            return False
+
+        report.status = AuditReportStatus.READY
+        report.summary_json = summary_json
+        report.built_at = func.clock_timestamp()
+        report.build_claim_token = None
+        report.build_claimed_at = None
+        report.last_build_error = None
+        report.next_retry_at = None
+        await session.flush()
+        return True
+
+
+async def run_claimed_build(
+    session: AsyncSession,
+    *,
+    claim: BuildClaim,
+) -> dict[str, Any]:
+    """Generate comparison summary for a claimed build (no Excel)."""
+    async with session.begin():
+        report = await session.scalar(
+            select(AuditReport).where(AuditReport.id == claim.report_id)
+        )
+        if report is None or report.build_claim_token != claim.claim_token:
+            raise ReportBuildClaimError("claim token mismatch before generate")
+        # Freeze previous_cycle_id: use stored value, do not recompute.
+        cycle = await session.scalar(
+            select(AuditCycle).where(AuditCycle.id == report.audit_cycle_id)
+        )
+        if cycle is None:
+            raise ReportBuildClaimError("audit cycle missing")
+
+        previous = None
+        if report.previous_cycle_id is not None:
+            previous = await session.scalar(
+                select(AuditCycle).where(AuditCycle.id == report.previous_cycle_id)
+            )
+
+        comparison = await compare_cycles(
+            session, current_cycle=cycle, previous_cycle=previous
+        )
+        summary = summarize_comparison(comparison).as_dict()
+        summary["generator_version"] = report.generator_version
+        summary["schema_version"] = report.schema_version
+        summary["input_hash"] = report.input_hash
+        return summary

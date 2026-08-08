@@ -1,0 +1,571 @@
+"""Deterministic period-over-period debt comparison (Stage 4.1).
+
+No Excel / Telegram / LLM. Pure Decimal arithmetic with strict NULL semantics.
+"""
+from __future__ import annotations
+
+import datetime as dt
+from collections import defaultdict
+from dataclasses import dataclass, field
+from decimal import Decimal
+from typing import Iterable, Sequence
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.domain.models import (
+    AuditCycle,
+    AuditCycleStatus,
+    DebtPosition,
+    SourceFile,
+    SourceFileLifecycle,
+)
+
+ADDITIVE_METRICS: tuple[str, ...] = (
+    "document_amount",
+    "total_debt",
+    "advance",
+    "not_due",
+    "overdue_1_7",
+    "overdue_8_14",
+    "overdue_15_21",
+    "overdue_22_30",
+    "overdue_over_31",
+)
+
+OVERDUE_BUCKETS: tuple[str, ...] = (
+    "overdue_1_7",
+    "overdue_8_14",
+    "overdue_15_21",
+    "overdue_22_30",
+    "overdue_over_31",
+)
+
+CONTROL_TOLERANCE = Decimal("0.01")
+
+
+@dataclass(frozen=True)
+class MetricDelta:
+    current: Decimal | None
+    previous: Decimal | None
+    abs_delta: Decimal | None
+    percent_delta: Decimal | None  # None → display as «н/д»
+
+
+@dataclass(frozen=True)
+class PositionSnapshot:
+    id: int
+    match_key: str
+    match_key_hash: str
+    outline_level: int
+    raw_label: str
+    counterparty_id: int
+    manager_group_id: int
+    source_file_id: int
+    department: str
+    metrics: dict[str, Decimal | None]
+    credit_limit: Decimal | None
+
+
+@dataclass(frozen=True)
+class MatchedEntity:
+    match_key: str
+    outline_level: int
+    current: PositionSnapshot | None
+    previous: PositionSnapshot | None
+    ambiguous: bool
+    collision_current_count: int
+    collision_previous_count: int
+    deltas: dict[str, MetricDelta]
+    overdue_profile_changed: bool
+    document_bucket_transition: tuple[str, str] | None
+    """(from_bucket, to_bucket) only when unique L4 match and exactly one bucket each side."""
+
+
+@dataclass(frozen=True)
+class ControlCollision:
+    match_key: str
+    cycle_side: str  # current | previous
+    count: int
+    raw_labels: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ControlEquality:
+    name: str
+    left: Decimal | None
+    right: Decimal | None
+    ok: bool
+    diagnostic: bool = False
+
+
+@dataclass(frozen=True)
+class CycleComparison:
+    current_cycle_id: int
+    current_report_date: dt.date
+    previous_cycle_id: int | None
+    previous_report_date: dt.date | None
+    entities: tuple[MatchedEntity, ...]
+    collisions: tuple[ControlCollision, ...]
+    control_equalities: tuple[ControlEquality, ...]
+    ambiguous_keys: frozenset[str]
+
+
+def abs_delta(
+    *,
+    curr_present: bool,
+    prev_present: bool,
+    curr_m: Decimal | None,
+    prev_m: Decimal | None,
+) -> Decimal | None:
+    """Strict NULL / missing-entity semantics from Stage 4 plan §3."""
+    if not curr_present and not prev_present:
+        return None
+    if curr_present and not prev_present:
+        return curr_m  # NULL stays NULL
+    if prev_present and not curr_present:
+        if prev_m is None:
+            return None
+        return Decimal("0") - prev_m
+    # both present
+    if curr_m is None or prev_m is None:
+        return None
+    return curr_m - prev_m
+
+
+def percent_delta(abs_d: Decimal | None, prev_m: Decimal | None) -> Decimal | None:
+    if abs_d is None or prev_m is None or prev_m <= 0:
+        return None
+    return (abs_d / prev_m) * Decimal("100")
+
+
+def compute_metric_deltas(
+    *,
+    curr: PositionSnapshot | None,
+    prev: PositionSnapshot | None,
+) -> dict[str, MetricDelta]:
+    curr_present = curr is not None
+    prev_present = prev is not None
+    out: dict[str, MetricDelta] = {}
+    for name in ADDITIVE_METRICS:
+        curr_m = curr.metrics.get(name) if curr is not None else None
+        prev_m = prev.metrics.get(name) if prev is not None else None
+        ad = abs_delta(
+            curr_present=curr_present,
+            prev_present=prev_present,
+            curr_m=curr_m,
+            prev_m=prev_m,
+        )
+        out[name] = MetricDelta(
+            current=curr_m if curr_present else None,
+            previous=prev_m if prev_present else None,
+            abs_delta=ad,
+            percent_delta=percent_delta(ad, prev_m if prev_present else None),
+        )
+    return out
+
+
+def overdue_vector(metrics: dict[str, Decimal | None]) -> tuple[Decimal | None, ...]:
+    return tuple(metrics.get(name) for name in OVERDUE_BUCKETS)
+
+
+def overdue_profile_changed(
+    curr: PositionSnapshot | None, prev: PositionSnapshot | None
+) -> bool:
+    if curr is None or prev is None:
+        return False
+    return overdue_vector(curr.metrics) != overdue_vector(prev.metrics)
+
+
+def _nonzero_buckets(metrics: dict[str, Decimal | None]) -> list[str]:
+    found: list[str] = []
+    for name in OVERDUE_BUCKETS:
+        value = metrics.get(name)
+        if value is not None and value != 0:
+            found.append(name)
+    return found
+
+
+def document_bucket_transition(
+    *,
+    outline_level: int,
+    ambiguous: bool,
+    curr: PositionSnapshot | None,
+    prev: PositionSnapshot | None,
+) -> tuple[str, str] | None:
+    """Only unique L4 matches may claim a document moved between overdue buckets."""
+    if ambiguous or outline_level != 4 or curr is None or prev is None:
+        return None
+    curr_b = _nonzero_buckets(curr.metrics)
+    prev_b = _nonzero_buckets(prev.metrics)
+    if len(curr_b) == 1 and len(prev_b) == 1 and curr_b[0] != prev_b[0]:
+        return (prev_b[0], curr_b[0])
+    return None
+
+
+def _sum_metrics(
+    positions: Iterable[PositionSnapshot], metric: str
+) -> Decimal | None:
+    total = Decimal("0")
+    any_value = False
+    for pos in positions:
+        value = pos.metrics.get(metric)
+        if value is None:
+            continue
+        total += value
+        any_value = True
+    return total if any_value else None
+
+
+def _snapshot_from_row(
+    row: DebtPosition, *, department: str
+) -> PositionSnapshot:
+    metrics = {name: getattr(row, name) for name in ADDITIVE_METRICS}
+    return PositionSnapshot(
+        id=row.id,
+        match_key=row.match_key,
+        match_key_hash=row.match_key_hash,
+        outline_level=row.outline_level,
+        raw_label=row.raw_label,
+        counterparty_id=row.counterparty_id,
+        manager_group_id=row.manager_group_id,
+        source_file_id=row.source_file_id,
+        department=department,
+        metrics=metrics,
+        credit_limit=row.credit_limit,
+    )
+
+
+async def find_previous_completed_cycle(
+    session: AsyncSession,
+    *,
+    current_report_date: dt.date,
+) -> AuditCycle | None:
+    return await session.scalar(
+        select(AuditCycle)
+        .where(
+            AuditCycle.status == AuditCycleStatus.COMPLETED,
+            AuditCycle.report_date < current_report_date,
+        )
+        .order_by(AuditCycle.report_date.desc())
+        .limit(1)
+    )
+
+
+async def load_active_positions(
+    session: AsyncSession, cycle_id: int
+) -> list[PositionSnapshot]:
+    rows = (
+        await session.execute(
+            select(DebtPosition, SourceFile.department)
+            .join(SourceFile, DebtPosition.source_file_id == SourceFile.id)
+            .where(
+                SourceFile.audit_cycle_id == cycle_id,
+                SourceFile.lifecycle_status == SourceFileLifecycle.ACTIVE,
+            )
+            .order_by(DebtPosition.id)
+        )
+    ).all()
+    return [
+        _snapshot_from_row(position, department=department.value)
+        for position, department in rows
+    ]
+
+
+def _index_by_match_key(
+    positions: Sequence[PositionSnapshot],
+) -> dict[str, list[PositionSnapshot]]:
+    indexed: dict[str, list[PositionSnapshot]] = defaultdict(list)
+    for pos in positions:
+        indexed[pos.match_key].append(pos)
+    return indexed
+
+
+def compare_position_sets(
+    *,
+    current: Sequence[PositionSnapshot],
+    previous: Sequence[PositionSnapshot],
+) -> tuple[tuple[MatchedEntity, ...], tuple[ControlCollision, ...], frozenset[str]]:
+    curr_idx = _index_by_match_key(current)
+    prev_idx = _index_by_match_key(previous)
+    all_keys = sorted(set(curr_idx) | set(prev_idx))
+
+    entities: list[MatchedEntity] = []
+    collisions: list[ControlCollision] = []
+    ambiguous: set[str] = set()
+
+    for key in all_keys:
+        curr_list = curr_idx.get(key, [])
+        prev_list = prev_idx.get(key, [])
+        curr_ambiguous = len(curr_list) > 1
+        prev_ambiguous = len(prev_list) > 1
+        is_ambiguous = curr_ambiguous or prev_ambiguous
+
+        if curr_ambiguous:
+            ambiguous.add(key)
+            collisions.append(
+                ControlCollision(
+                    match_key=key,
+                    cycle_side="current",
+                    count=len(curr_list),
+                    raw_labels=tuple(p.raw_label for p in curr_list),
+                )
+            )
+        if prev_ambiguous:
+            ambiguous.add(key)
+            collisions.append(
+                ControlCollision(
+                    match_key=key,
+                    cycle_side="previous",
+                    count=len(prev_list),
+                    raw_labels=tuple(p.raw_label for p in prev_list),
+                )
+            )
+
+        curr_one = curr_list[0] if len(curr_list) == 1 else None
+        prev_one = prev_list[0] if len(prev_list) == 1 else None
+        level = (
+            curr_one.outline_level
+            if curr_one is not None
+            else prev_one.outline_level
+            if prev_one is not None
+            else curr_list[0].outline_level
+            if curr_list
+            else prev_list[0].outline_level
+        )
+
+        if is_ambiguous:
+            # No silent entity deltas for ambiguous keys.
+            deltas = {
+                name: MetricDelta(
+                    current=None, previous=None, abs_delta=None, percent_delta=None
+                )
+                for name in ADDITIVE_METRICS
+            }
+            entities.append(
+                MatchedEntity(
+                    match_key=key,
+                    outline_level=level,
+                    current=None,
+                    previous=None,
+                    ambiguous=True,
+                    collision_current_count=len(curr_list),
+                    collision_previous_count=len(prev_list),
+                    deltas=deltas,
+                    overdue_profile_changed=False,
+                    document_bucket_transition=None,
+                )
+            )
+            continue
+
+        deltas = compute_metric_deltas(curr=curr_one, prev=prev_one)
+        entities.append(
+            MatchedEntity(
+                match_key=key,
+                outline_level=level,
+                current=curr_one,
+                previous=prev_one,
+                ambiguous=False,
+                collision_current_count=len(curr_list),
+                collision_previous_count=len(prev_list),
+                deltas=deltas,
+                overdue_profile_changed=overdue_profile_changed(curr_one, prev_one),
+                document_bucket_transition=document_bucket_transition(
+                    outline_level=level,
+                    ambiguous=False,
+                    curr=curr_one,
+                    prev=prev_one,
+                ),
+            )
+        )
+
+    return tuple(entities), tuple(collisions), frozenset(ambiguous)
+
+
+def build_l1_control_equalities(
+    current: Sequence[PositionSnapshot],
+) -> tuple[ControlEquality, ...]:
+    """L1 rollups only; L2–L4 are disclosure-only (not in these equalities)."""
+    l1 = [p for p in current if p.outline_level == 1]
+    checks: list[ControlEquality] = []
+
+    company_total = _sum_metrics(l1, "total_debt")
+    by_dept: dict[str, list[PositionSnapshot]] = defaultdict(list)
+    for pos in l1:
+        by_dept[pos.department].append(pos)
+    dept_sum = Decimal("0")
+    any_dept = False
+    for positions in by_dept.values():
+        part = _sum_metrics(positions, "total_debt")
+        if part is not None:
+            dept_sum += part
+            any_dept = True
+    dept_total = dept_sum if any_dept else None
+    checks.append(
+        ControlEquality(
+            name="company_total_debt_vs_sum_departments",
+            left=company_total,
+            right=dept_total,
+            ok=_near(company_total, dept_total),
+        )
+    )
+
+    for dept, positions in sorted(by_dept.items()):
+        dept_total_m = _sum_metrics(positions, "total_debt")
+        by_mg: dict[int, list[PositionSnapshot]] = defaultdict(list)
+        for pos in positions:
+            by_mg[pos.manager_group_id].append(pos)
+        mg_sum = Decimal("0")
+        any_mg = False
+        for mg_positions in by_mg.values():
+            part = _sum_metrics(mg_positions, "total_debt")
+            if part is not None:
+                mg_sum += part
+                any_mg = True
+        mg_total = mg_sum if any_mg else None
+        checks.append(
+            ControlEquality(
+                name=f"department_{dept}_vs_sum_manager_groups",
+                left=dept_total_m,
+                right=mg_total,
+                ok=_near(dept_total_m, mg_total),
+            )
+        )
+        for mg_id, mg_positions in sorted(by_mg.items()):
+            mg_total_m = _sum_metrics(mg_positions, "total_debt")
+            by_cp: dict[int, list[PositionSnapshot]] = defaultdict(list)
+            for pos in mg_positions:
+                by_cp[pos.counterparty_id].append(pos)
+            cp_sum = Decimal("0")
+            any_cp = False
+            for cp_positions in by_cp.values():
+                # Each L1 row is one counterparty; sum of L1 within MG.
+                part = _sum_metrics(cp_positions, "total_debt")
+                if part is not None:
+                    cp_sum += part
+                    any_cp = True
+            cp_total = cp_sum if any_cp else None
+            checks.append(
+                ControlEquality(
+                    name=f"manager_group_{mg_id}_vs_sum_counterparties",
+                    left=mg_total_m,
+                    right=cp_total,
+                    ok=_near(mg_total_m, cp_total),
+                )
+            )
+
+    # credit_limit diagnostic only (may diverge from reported grand totals)
+    credit_sum = None
+    credit_acc = Decimal("0")
+    any_credit = False
+    for pos in l1:
+        if pos.credit_limit is None:
+            continue
+        credit_acc += pos.credit_limit
+        any_credit = True
+    if any_credit:
+        credit_sum = credit_acc
+    checks.append(
+        ControlEquality(
+            name="credit_limit_l1_sum_diagnostic",
+            left=credit_sum,
+            right=None,
+            ok=True,
+            diagnostic=True,
+        )
+    )
+
+    checks.append(
+        ControlEquality(
+            name="l2_l4_disclosure_only",
+            left=None,
+            right=None,
+            ok=True,
+            diagnostic=True,
+        )
+    )
+    return tuple(checks)
+
+
+def _near(left: Decimal | None, right: Decimal | None) -> bool:
+    if left is None and right is None:
+        return True
+    if left is None or right is None:
+        return False
+    return abs(left - right) <= CONTROL_TOLERANCE
+
+
+async def compare_cycles(
+    session: AsyncSession,
+    *,
+    current_cycle: AuditCycle,
+    previous_cycle: AuditCycle | None = None,
+) -> CycleComparison:
+    if previous_cycle is None:
+        previous_cycle = await find_previous_completed_cycle(
+            session, current_report_date=current_cycle.report_date
+        )
+
+    current_positions = await load_active_positions(session, current_cycle.id)
+    previous_positions: list[PositionSnapshot] = []
+    if previous_cycle is not None:
+        previous_positions = await load_active_positions(session, previous_cycle.id)
+
+    entities, collisions, ambiguous = compare_position_sets(
+        current=current_positions, previous=previous_positions
+    )
+    controls = build_l1_control_equalities(current_positions)
+    return CycleComparison(
+        current_cycle_id=current_cycle.id,
+        current_report_date=current_cycle.report_date,
+        previous_cycle_id=previous_cycle.id if previous_cycle else None,
+        previous_report_date=previous_cycle.report_date if previous_cycle else None,
+        entities=entities,
+        collisions=collisions,
+        control_equalities=controls,
+        ambiguous_keys=ambiguous,
+    )
+
+
+@dataclass
+class ComparisonSummary:
+    """Compact JSON-serializable summary stored on AuditReport.summary_json."""
+
+    previous_cycle_id: int | None
+    previous_report_date: str | None
+    entity_count: int
+    ambiguous_key_count: int
+    collision_count: int
+    overdue_profile_change_count: int
+    control_failures: list[str] = field(default_factory=list)
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "previous_cycle_id": self.previous_cycle_id,
+            "previous_report_date": self.previous_report_date,
+            "entity_count": self.entity_count,
+            "ambiguous_key_count": self.ambiguous_key_count,
+            "collision_count": self.collision_count,
+            "overdue_profile_change_count": self.overdue_profile_change_count,
+            "control_failures": self.control_failures,
+        }
+
+
+def summarize_comparison(comparison: CycleComparison) -> ComparisonSummary:
+    return ComparisonSummary(
+        previous_cycle_id=comparison.previous_cycle_id,
+        previous_report_date=(
+            comparison.previous_report_date.isoformat()
+            if comparison.previous_report_date
+            else None
+        ),
+        entity_count=len(comparison.entities),
+        ambiguous_key_count=len(comparison.ambiguous_keys),
+        collision_count=len(comparison.collisions),
+        overdue_profile_change_count=sum(
+            1 for e in comparison.entities if e.overdue_profile_changed
+        ),
+        control_failures=[
+            c.name for c in comparison.control_equalities if not c.ok and not c.diagnostic
+        ],
+    )

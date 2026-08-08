@@ -17,7 +17,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.enums import Department
-from app.domain.matching import normalize_name
+from app.domain.matching import build_match_key, match_key_hash, normalize_name
 from app.domain.models import (
     Counterparty,
     DebtPosition,
@@ -167,6 +167,16 @@ async def persist_valid_source_file(
             else None
         )
 
+        normalized_label = normalize_name(debt_row.raw_label)
+        key = build_match_key(
+            counterparty_id=counterparty.id,
+            outline_level=debt_row.outline_level,
+            normalized_label=normalized_label,
+            parent_match_key=(
+                parent_position.match_key if parent_position is not None else None
+            ),
+        )
+
         position = DebtPosition(
             source_file_id=source_file.id,
             manager_group_id=manager_group.id,
@@ -175,6 +185,9 @@ async def persist_valid_source_file(
             outline_level=debt_row.outline_level,
             row_order=debt_row.row_index,
             raw_label=debt_row.raw_label,
+            normalized_label=normalized_label,
+            match_key=key,
+            match_key_hash=match_key_hash(key),
             payment_deferral_days=debt_row.payment_deferral_days,
             payment_deferral_error=debt_row.payment_deferral_error,
             credit_limit=debt_row.credit_limit,
