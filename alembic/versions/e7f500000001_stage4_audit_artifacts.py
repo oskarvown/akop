@@ -77,6 +77,14 @@ def upgrade() -> None:
             "revision",
             name="uq_audit_artifact_report_kind_revision",
         ),
+        sa.CheckConstraint(
+            "revision >= 1",
+            name="ck_audit_artifact_revision_ge_1",
+        ),
+        sa.CheckConstraint(
+            "(kind <> 'core') OR (revision = 1)",
+            name="ck_audit_artifact_core_revision_eq_1",
+        ),
     )
     op.create_index(
         "uq_audit_artifact_comment_analysis_batch_id",

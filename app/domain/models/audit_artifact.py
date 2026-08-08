@@ -7,6 +7,7 @@ import uuid
 from typing import TYPE_CHECKING
 
 from sqlalchemy import (
+    CheckConstraint,
     DateTime,
     Enum,
     ForeignKey,
@@ -40,6 +41,11 @@ class AuditArtifact(Base):
             "kind",
             "revision",
             name="uq_audit_artifact_report_kind_revision",
+        ),
+        CheckConstraint("revision >= 1", name="ck_audit_artifact_revision_ge_1"),
+        CheckConstraint(
+            "(kind <> 'core') OR (revision = 1)",
+            name="ck_audit_artifact_core_revision_eq_1",
         ),
         Index(
             "uq_audit_artifact_comment_analysis_batch_id",

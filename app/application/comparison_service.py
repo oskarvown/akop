@@ -114,6 +114,9 @@ class CycleComparison:
     collisions: tuple[ControlCollision, ...]
     control_equalities: tuple[ControlEquality, ...]
     ambiguous_keys: frozenset[str]
+    # Raw L1–L4 snapshots for accounting aggregates (includes collision rows).
+    current_positions: tuple[PositionSnapshot, ...] = ()
+    previous_positions: tuple[PositionSnapshot, ...] = ()
 
 
 def abs_delta(
@@ -621,6 +624,8 @@ async def compare_cycles(
         collisions=collisions,
         control_equalities=controls,
         ambiguous_keys=ambiguous,
+        current_positions=tuple(current_positions),
+        previous_positions=tuple(previous_positions),
     )
 
 

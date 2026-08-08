@@ -34,7 +34,7 @@ from app.domain.models import (
 
 logger = logging.getLogger(__name__)
 
-GENERATOR_VERSION = "stage4.2.0"
+GENERATOR_VERSION = "stage4.2.1"
 SCHEMA_VERSION = "stage4.v1"
 
 
@@ -443,7 +443,7 @@ async def run_claimed_build(
     *,
     claim: BuildClaim,
 ) -> BuildResult:
-    """Compare cycles and build CORE Excel bytes for a claimed report."""
+    """Load comparison under a short read txn, then build CORE Excel outside it."""
     async with session.begin():
         report = await session.scalar(
             select(AuditReport).where(AuditReport.id == claim.report_id)
@@ -465,15 +465,19 @@ async def run_claimed_build(
         comparison = await compare_cycles(
             session, current_cycle=cycle, previous_cycle=previous
         )
-        summary = summarize_comparison(comparison).as_dict()
-        summary["generator_version"] = report.generator_version
-        summary["schema_version"] = report.schema_version
-        summary["input_hash"] = report.input_hash
+        generator_version = report.generator_version
+        schema_version = report.schema_version
+        input_hash = report.input_hash
 
-        excel_bytes, excel_sha256 = build_core_excel_bytes(comparison)
-        summary["excel_sha256"] = excel_sha256
-        return BuildResult(
-            summary_json=summary,
-            excel_bytes=excel_bytes,
-            excel_sha256=excel_sha256,
-        )
+    # Excel generation intentionally runs after the DB transaction is closed.
+    summary = summarize_comparison(comparison).as_dict()
+    summary["generator_version"] = generator_version
+    summary["schema_version"] = schema_version
+    summary["input_hash"] = input_hash
+    excel_bytes, excel_sha256 = build_core_excel_bytes(comparison)
+    summary["excel_sha256"] = excel_sha256
+    return BuildResult(
+        summary_json=summary,
+        excel_bytes=excel_bytes,
+        excel_sha256=excel_sha256,
+    )
