@@ -162,7 +162,55 @@ async def recover_missing_reports(session: AsyncSession) -> list[int]:
     return created
 
 
+async def recover_stale_building_reports(
+    session: AsyncSession,
+    *,
+    settings: object,
+    now_utc: dt.datetime | None = None,
+) -> list[int]:
+    """Scheduler-safe TTL recovery: stale BUILDING → FAILED with next_retry_at=now.
+
+    Uses FOR UPDATE SKIP LOCKED so concurrent scheduler ticks do not collide.
+    Reports with build_attempt_count >= MAX stay FAILED without next_retry_at
+    after the reclaim (terminal until manual intervention).
+    """
+    now = _ensure_utc(now_utc or dt.datetime.now(dt.timezone.utc))
+    claim_ttl = int(settings.report_build_claim_ttl_seconds)  # type: ignore[attr-defined]
+    max_attempts = int(settings.report_build_max_attempts)  # type: ignore[attr-defined]
+    recovered: list[int] = []
+
+    async with session.begin():
+        rows = (
+            await session.execute(
+                select(AuditReport)
+                .where(AuditReport.status == AuditReportStatus.BUILDING)
+                .order_by(AuditReport.id)
+                .with_for_update(skip_locked=True)
+            )
+        ).scalars().all()
+        for report in rows:
+            if _claim_is_active(
+                token=report.build_claim_token,
+                claimed_at=report.build_claimed_at,
+                now_utc=now,
+                claim_ttl_seconds=claim_ttl,
+            ):
+                continue
+            report.status = AuditReportStatus.FAILED
+            report.last_build_error = "build_claim_ttl_expired"
+            report.build_claim_token = None
+            report.build_claimed_at = None
+            if report.build_attempt_count >= max_attempts:
+                report.next_retry_at = None
+            else:
+                report.next_retry_at = now
+            recovered.append(report.id)
+        await session.flush()
+    return recovered
+
+
 async def list_buildable_report_ids(session: AsyncSession) -> list[int]:
+    """List PENDING/FAILED ids only (no TTL side effects). Prefer prepare_*."""
     async with session.begin():
         rows = (
             await session.execute(
@@ -178,6 +226,51 @@ async def list_buildable_report_ids(session: AsyncSession) -> list[int]:
         return list(rows)
 
 
+async def prepare_buildable_report_ids(
+    session_maker: object,
+    *,
+    settings: object,
+    now_utc: dt.datetime | None = None,
+) -> list[int]:
+    """Scheduler entrypoint: recover stale BUILDING, then list retryable reports.
+
+    ``session_maker`` must be an ``async_sessionmaker`` (callable returning session).
+    Recovery and listing use separate short transactions, matching a scheduler tick.
+    """
+    now = _ensure_utc(now_utc or dt.datetime.now(dt.timezone.utc))
+    max_attempts = int(settings.report_build_max_attempts)  # type: ignore[attr-defined]
+
+    async with session_maker() as session:  # type: ignore[operator]
+        await recover_stale_building_reports(
+            session, settings=settings, now_utc=now
+        )
+
+    async with session_maker() as session:  # type: ignore[operator]
+        async with session.begin():
+            rows = (
+                await session.execute(
+                    select(AuditReport)
+                    .where(
+                        AuditReport.status.in_(
+                            (AuditReportStatus.PENDING, AuditReportStatus.FAILED)
+                        )
+                    )
+                    .order_by(AuditReport.id)
+                )
+            ).scalars().all()
+            result: list[int] = []
+            for report in rows:
+                if report.status == AuditReportStatus.FAILED:
+                    if report.build_attempt_count >= max_attempts:
+                        continue
+                    if report.next_retry_at is not None and _ensure_utc(
+                        report.next_retry_at
+                    ) > now:
+                        continue
+                result.append(report.id)
+            return result
+
+
 async def claim_report_build(
     session: AsyncSession,
     *,
@@ -185,9 +278,12 @@ async def claim_report_build(
     settings: object,
     now_utc: dt.datetime | None = None,
 ) -> BuildClaim | None:
-    """Atomic PENDING/FAILED → BUILDING. Commit before generation."""
+    """Atomic PENDING/FAILED → BUILDING. Commit before generation.
+
+    Does not reclaim stale BUILDING — that is ``recover_stale_building_reports`` /
+    ``prepare_buildable_report_ids`` responsibility for the scheduler flow.
+    """
     now = _ensure_utc(now_utc or dt.datetime.now(dt.timezone.utc))
-    claim_ttl = int(settings.report_build_claim_ttl_seconds)  # type: ignore[attr-defined]
     max_attempts = int(settings.report_build_max_attempts)  # type: ignore[attr-defined]
 
     async with session.begin():
@@ -200,22 +296,6 @@ async def claim_report_build(
             AuditReportStatus.PENDING,
             AuditReportStatus.FAILED,
         ):
-            # Stale BUILDING past TTL → reclaim as FAILED then allow next tick.
-            if (
-                report.status == AuditReportStatus.BUILDING
-                and not _claim_is_active(
-                    token=report.build_claim_token,
-                    claimed_at=report.build_claimed_at,
-                    now_utc=now,
-                    claim_ttl_seconds=claim_ttl,
-                )
-            ):
-                report.status = AuditReportStatus.FAILED
-                report.last_build_error = "build_claim_ttl_expired"
-                report.build_claim_token = None
-                report.build_claimed_at = None
-                report.next_retry_at = now
-                await session.flush()
             return None
 
         if report.status == AuditReportStatus.FAILED:
@@ -230,7 +310,9 @@ async def claim_report_build(
             token=report.build_claim_token,
             claimed_at=report.build_claimed_at,
             now_utc=now,
-            claim_ttl_seconds=claim_ttl,
+            claim_ttl_seconds=int(
+                settings.report_build_claim_ttl_seconds  # type: ignore[attr-defined]
+            ),
         ):
             return None
 

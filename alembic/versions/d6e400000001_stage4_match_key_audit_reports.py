@@ -119,73 +119,9 @@ def upgrade() -> None:
 
 def _backfill_match_keys() -> None:
     """Backfill in outline_level order so parent match_key is available."""
-    import hashlib
-    import re
-    import unicodedata
+    from app.domain.matching.match_key import backfill_match_keys_on_connection
 
-    from sqlalchemy import text
-
-    conn = op.get_bind()
-    whitespace_re = re.compile(r"\s+")
-
-    def normalize_name(raw_name: str) -> str:
-        text_value = unicodedata.normalize("NFKC", raw_name)
-        text_value = text_value.strip()
-        text_value = whitespace_re.sub(" ", text_value)
-        return text_value.casefold()
-
-    def match_key_hash(match_key: str) -> str:
-        return hashlib.sha256(match_key.encode("utf-8")).hexdigest()
-
-    rows = conn.execute(
-        text(
-            "SELECT id, counterparty_id, parent_position_id, outline_level, raw_label "
-            "FROM debt_positions ORDER BY outline_level ASC, id ASC"
-        )
-    ).fetchall()
-
-    key_by_id: dict[int, str] = {}
-    for row in rows:
-        position_id = int(row[0])
-        counterparty_id = int(row[1])
-        parent_id = row[2]
-        outline_level = int(row[3])
-        raw_label = str(row[4])
-        normalized = normalize_name(raw_label)
-        if outline_level == 1:
-            key = f"c:{counterparty_id}"
-        else:
-            if parent_id is None or int(parent_id) not in key_by_id:
-                raise RuntimeError(
-                    f"debt_positions.id={position_id} missing parent match_key "
-                    f"for outline_level={outline_level}"
-                )
-            key = f"{key_by_id[int(parent_id)]}|{outline_level}:{normalized}"
-        key_by_id[position_id] = key
-        conn.execute(
-            text(
-                "UPDATE debt_positions "
-                "SET normalized_label = :normalized_label, "
-                "match_key = :match_key, "
-                "match_key_hash = :match_key_hash "
-                "WHERE id = :id"
-            ),
-            {
-                "id": position_id,
-                "normalized_label": normalized,
-                "match_key": key,
-                "match_key_hash": match_key_hash(key),
-            },
-        )
-
-    nulls = conn.execute(
-        text(
-            "SELECT COUNT(*) FROM debt_positions "
-            "WHERE normalized_label IS NULL OR match_key IS NULL OR match_key_hash IS NULL"
-        )
-    ).scalar()
-    if nulls:
-        raise RuntimeError(f"match_key backfill left {nulls} NULL rows")
+    backfill_match_keys_on_connection(op.get_bind())
 
 
 def downgrade() -> None:

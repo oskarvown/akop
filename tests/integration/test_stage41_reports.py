@@ -1,31 +1,45 @@
 """Integration tests for Stage 4.1 match keys, AuditReport enqueue, build claim."""
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import uuid
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import pytest
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.application.audit_service import add_source_file_atomic
-from app.application.comparison_service import compare_cycles
+from app.application.comparison_service import (
+    ADDITIVE_METRICS,
+    compare_cycles,
+    summarize_comparison,
+)
 from app.application.report_service import (
     claim_report_build,
     complete_report_build,
     fail_report_build,
+    prepare_buildable_report_ids,
     recover_missing_reports,
     run_claimed_build,
 )
 from app.domain.enums import Department
+from app.domain.matching import (
+    backfill_match_keys_on_connection,
+    build_match_key,
+    match_key_hash,
+)
+from app.domain.matching.normalization import normalize_name
 from app.domain.models import (
     AuditCycle,
     AuditCycleStatus,
     AuditReport,
     AuditReportStatus,
     DebtPosition,
+    SourceFile,
 )
 from app.infrastructure.excel.validator import (
     ValidationResult,
@@ -310,10 +324,11 @@ async def test_build_fail_retry_and_max_attempts(
 
 
 @pytest.mark.asyncio
-async def test_build_ttl_reclaim(
+async def test_build_ttl_reclaim_via_scheduler_prepare_flow(
     stage3_session_maker: async_sessionmaker[AsyncSession],
     valid_result: ValidationResult,
 ) -> None:
+    """Stale BUILDING is recovered by prepare_buildable_report_ids, not claim()."""
     async with stage3_session_maker() as session:
         cycle_id = await complete_cycle(
             session,
@@ -335,7 +350,7 @@ async def test_build_ttl_reclaim(
         )
     assert claim is not None
 
-    # Simulate stale claim
+    # Direct claim must NOT recover BUILDING (scheduler path owns recovery).
     async with stage3_session_maker() as session:
         report = await session.get(AuditReport, report_id)
         assert report is not None
@@ -344,18 +359,27 @@ async def test_build_ttl_reclaim(
         )
         await session.commit()
 
-    # First call reclaims to FAILED; second can claim again
     async with stage3_session_maker() as session:
-        again = await claim_report_build(
-            session, report_id=report_id, settings=settings
+        assert (
+            await claim_report_build(session, report_id=report_id, settings=settings)
+            is None
         )
-    assert again is None
+    async with stage3_session_maker() as session:
+        report = await session.get(AuditReport, report_id)
+        assert report is not None
+        assert report.status == AuditReportStatus.BUILDING
+
+    candidates = await prepare_buildable_report_ids(
+        stage3_session_maker, settings=settings
+    )
+    assert report_id in candidates
+
     async with stage3_session_maker() as session:
         report = await session.get(AuditReport, report_id)
         assert report is not None
         assert report.status == AuditReportStatus.FAILED
-        report.next_retry_at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=1)
-        await session.commit()
+        assert report.last_build_error == "build_claim_ttl_expired"
+        assert report.build_claim_token is None
 
     async with stage3_session_maker() as session:
         reclaim_claim = await claim_report_build(
@@ -442,3 +466,245 @@ async def test_complete_rejects_wrong_token(
             summary_json={"x": 1},
         )
     assert ok is False
+
+
+@pytest.mark.asyncio
+async def test_compare_cycles_grand_totals_and_control_failures(
+    stage3_session: AsyncSession,
+    valid_result: ValidationResult,
+) -> None:
+    cycle_id = await complete_cycle(
+        stage3_session,
+        valid_result,
+        report_date=dt.date(2026, 8, 9),
+        sha_prefix="s41-ctrl",
+    )
+    cycle = await stage3_session.scalar(
+        select(AuditCycle).where(AuditCycle.id == cycle_id)
+    )
+    assert cycle is not None
+
+    comparison = await compare_cycles(stage3_session, current_cycle=cycle)
+    additive_rollup_names = [
+        c.name
+        for c in comparison.control_equalities
+        if not c.diagnostic and "vs_sum_" in c.name
+    ]
+    for metric in ADDITIVE_METRICS:
+        assert any(
+            f"company_{metric}_vs_sum_departments" == name
+            for name in additive_rollup_names
+        )
+
+    # Happy path: L1 vs reported_grand_totals ok for blocking metrics
+    file_checks = [
+        c
+        for c in comparison.control_equalities
+        if "l1_vs_reported_grand_totals" in c.name and not c.diagnostic
+    ]
+    assert file_checks
+    assert all(c.ok for c in file_checks)
+
+    credit_checks = [
+        c
+        for c in comparison.control_equalities
+        if c.diagnostic and "credit_limit" in c.name
+    ]
+    assert credit_checks
+
+    # Induce blocking mismatch on one ACTIVE file
+    source_file = await stage3_session.scalar(
+        select(SourceFile)
+        .where(SourceFile.audit_cycle_id == cycle_id)
+        .order_by(SourceFile.id)
+        .limit(1)
+    )
+    assert source_file is not None
+    totals = dict(source_file.reported_grand_totals or {})
+    totals["total_debt"] = "999999.99"
+    source_file.reported_grand_totals = totals
+    await stage3_session.flush()
+
+    comparison_bad = await compare_cycles(stage3_session, current_cycle=cycle)
+    summary = summarize_comparison(comparison_bad)
+    assert any(
+        f"source_file_{source_file.id}_total_debt_l1_vs_reported_grand_totals" == name
+        for name in summary.control_failures
+    )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_claim_exactly_one_winner(
+    stage3_session_maker: async_sessionmaker[AsyncSession],
+    valid_result: ValidationResult,
+) -> None:
+    async with stage3_session_maker() as session:
+        cycle_id = await complete_cycle(
+            session,
+            valid_result,
+            report_date=dt.date(2026, 8, 10),
+            sha_prefix="s41-race",
+        )
+        report = await session.scalar(
+            select(AuditReport).where(AuditReport.audit_cycle_id == cycle_id)
+        )
+        assert report is not None
+        report_id = report.id
+        await session.commit()
+
+    settings = _settings()
+
+    async def _claim() -> object | None:
+        async with stage3_session_maker() as session:
+            return await claim_report_build(
+                session, report_id=report_id, settings=settings
+            )
+
+    claim_a, claim_b = await asyncio.gather(_claim(), _claim())
+    winners = [c for c in (claim_a, claim_b) if c is not None]
+    assert len(winners) == 1
+
+
+@pytest.mark.asyncio
+async def test_enqueue_failure_rolls_back_completed_status(
+    stage3_session: AsyncSession,
+    valid_result: ValidationResult,
+) -> None:
+    report_date = dt.date(2026, 8, 11)
+    dated = result_for_date(valid_result, report_date)
+    for index, department in enumerate(list(Department)[:4]):
+        result = await add_source_file_atomic(
+            stage3_session,
+            result=dated,
+            department=department,
+            sha256=f"s41-atomic-{index}",
+            original_filename=f"s41-atomic-{index}.xls",
+            report_date=report_date,
+            notification_chat_id=NOTIFY_CHAT_ID,
+        )
+        assert result.status == AuditCycleStatus.COLLECTING
+
+    with patch(
+        "app.application.report_service.enqueue_pending_report",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("enqueue boom"),
+    ):
+        with pytest.raises(RuntimeError, match="enqueue boom"):
+            await add_source_file_atomic(
+                stage3_session,
+                result=dated,
+                department=list(Department)[4],
+                sha256="s41-atomic-4",
+                original_filename="s41-atomic-4.xls",
+                report_date=report_date,
+                notification_chat_id=NOTIFY_CHAT_ID,
+            )
+
+    cycle = await stage3_session.scalar(
+        select(AuditCycle).where(AuditCycle.report_date == report_date)
+    )
+    assert cycle is not None
+    assert cycle.status == AuditCycleStatus.COLLECTING
+    report = await stage3_session.scalar(
+        select(AuditReport).where(AuditReport.audit_cycle_id == cycle.id)
+    )
+    assert report is None
+
+
+@pytest.mark.asyncio
+async def test_migration_backfill_recomputes_null_match_keys(
+    stage3_session_maker: async_sessionmaker[AsyncSession],
+    valid_result: ValidationResult,
+) -> None:
+    """Simulate pre-d6e400000001 rows (NULL match fields) and run shared backfill."""
+    async with stage3_session_maker() as session:
+        await complete_cycle(
+            session,
+            valid_result,
+            report_date=dt.date(2026, 8, 12),
+            sha_prefix="s41-bf",
+        )
+        await session.commit()
+
+    try:
+        async with stage3_session_maker() as session:
+            await session.execute(
+                text(
+                    "ALTER TABLE debt_positions "
+                    "ALTER COLUMN normalized_label DROP NOT NULL, "
+                    "ALTER COLUMN match_key DROP NOT NULL, "
+                    "ALTER COLUMN match_key_hash DROP NOT NULL"
+                )
+            )
+            await session.execute(
+                text(
+                    "UPDATE debt_positions "
+                    "SET normalized_label = NULL, match_key = NULL, "
+                    "match_key_hash = NULL"
+                )
+            )
+            await session.commit()
+
+        async with stage3_session_maker() as session:
+            null_count = await session.scalar(
+                text(
+                    "SELECT COUNT(*) FROM debt_positions "
+                    "WHERE match_key IS NULL OR match_key_hash IS NULL"
+                )
+            )
+            assert int(null_count or 0) > 0
+
+            conn = await session.connection()
+            updated = await conn.run_sync(backfill_match_keys_on_connection)
+            assert updated > 0
+            await session.commit()
+
+        async with stage3_session_maker() as session:
+            positions = (
+                await session.execute(select(DebtPosition).order_by(DebtPosition.id))
+            ).scalars().all()
+            assert positions
+            for position in positions:
+                expected_norm = normalize_name(position.raw_label)
+                assert position.normalized_label == expected_norm
+                if position.outline_level == 1:
+                    expected = build_match_key(
+                        counterparty_id=position.counterparty_id,
+                        outline_level=1,
+                        normalized_label=expected_norm,
+                        parent_match_key=None,
+                    )
+                else:
+                    parent = await session.get(
+                        DebtPosition, position.parent_position_id
+                    )
+                    assert parent is not None
+                    expected = build_match_key(
+                        counterparty_id=position.counterparty_id,
+                        outline_level=position.outline_level,
+                        normalized_label=expected_norm,
+                        parent_match_key=parent.match_key,
+                    )
+                assert position.match_key == expected
+                assert position.match_key_hash == match_key_hash(expected)
+    finally:
+        async with stage3_session_maker() as session:
+            await session.execute(
+                text(
+                    "UPDATE debt_positions "
+                    "SET normalized_label = COALESCE(normalized_label, ''), "
+                    "match_key = COALESCE(match_key, ''), "
+                    "match_key_hash = COALESCE(match_key_hash, '') "
+                    "WHERE normalized_label IS NULL OR match_key IS NULL "
+                    "OR match_key_hash IS NULL"
+                )
+            )
+            await session.execute(
+                text(
+                    "ALTER TABLE debt_positions "
+                    "ALTER COLUMN normalized_label SET NOT NULL, "
+                    "ALTER COLUMN match_key SET NOT NULL, "
+                    "ALTER COLUMN match_key_hash SET NOT NULL"
+                )
+            )
+            await session.commit()

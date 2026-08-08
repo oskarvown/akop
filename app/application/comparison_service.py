@@ -382,98 +382,109 @@ def compare_position_sets(
     return tuple(entities), tuple(collisions), frozenset(ambiguous)
 
 
+def _near(left: Decimal | None, right: Decimal | None) -> bool:
+    if left is None and right is None:
+        return True
+    if left is None or right is None:
+        return False
+    return abs(left - right) <= CONTROL_TOLERANCE
+
+
+def _parse_reported_metric(raw: object | None) -> Decimal | None:
+    if raw is None:
+        return None
+    if isinstance(raw, Decimal):
+        return raw
+    text = str(raw).strip()
+    if not text:
+        return None
+    return Decimal(text)
+
+
+def _sum_credit_limit(positions: Iterable[PositionSnapshot]) -> Decimal | None:
+    total = Decimal("0")
+    any_value = False
+    for pos in positions:
+        if pos.credit_limit is None:
+            continue
+        total += pos.credit_limit
+        any_value = True
+    return total if any_value else None
+
+
 def build_l1_control_equalities(
     current: Sequence[PositionSnapshot],
 ) -> tuple[ControlEquality, ...]:
-    """L1 rollups only; L2–L4 are disclosure-only (not in these equalities)."""
+    """L1 rollups for every additive metric; L2–L4 are disclosure-only."""
     l1 = [p for p in current if p.outline_level == 1]
     checks: list[ControlEquality] = []
-
-    company_total = _sum_metrics(l1, "total_debt")
     by_dept: dict[str, list[PositionSnapshot]] = defaultdict(list)
     for pos in l1:
         by_dept[pos.department].append(pos)
-    dept_sum = Decimal("0")
-    any_dept = False
-    for positions in by_dept.values():
-        part = _sum_metrics(positions, "total_debt")
-        if part is not None:
-            dept_sum += part
-            any_dept = True
-    dept_total = dept_sum if any_dept else None
-    checks.append(
-        ControlEquality(
-            name="company_total_debt_vs_sum_departments",
-            left=company_total,
-            right=dept_total,
-            ok=_near(company_total, dept_total),
-        )
-    )
 
-    for dept, positions in sorted(by_dept.items()):
-        dept_total_m = _sum_metrics(positions, "total_debt")
-        by_mg: dict[int, list[PositionSnapshot]] = defaultdict(list)
-        for pos in positions:
-            by_mg[pos.manager_group_id].append(pos)
-        mg_sum = Decimal("0")
-        any_mg = False
-        for mg_positions in by_mg.values():
-            part = _sum_metrics(mg_positions, "total_debt")
+    for metric in ADDITIVE_METRICS:
+        company_total = _sum_metrics(l1, metric)
+        dept_sum = Decimal("0")
+        any_dept = False
+        for positions in by_dept.values():
+            part = _sum_metrics(positions, metric)
             if part is not None:
-                mg_sum += part
-                any_mg = True
-        mg_total = mg_sum if any_mg else None
+                dept_sum += part
+                any_dept = True
+        dept_total = dept_sum if any_dept else None
         checks.append(
             ControlEquality(
-                name=f"department_{dept}_vs_sum_manager_groups",
-                left=dept_total_m,
-                right=mg_total,
-                ok=_near(dept_total_m, mg_total),
+                name=f"company_{metric}_vs_sum_departments",
+                left=company_total,
+                right=dept_total,
+                ok=_near(company_total, dept_total),
             )
         )
-        for mg_id, mg_positions in sorted(by_mg.items()):
-            mg_total_m = _sum_metrics(mg_positions, "total_debt")
-            by_cp: dict[int, list[PositionSnapshot]] = defaultdict(list)
-            for pos in mg_positions:
-                by_cp[pos.counterparty_id].append(pos)
-            cp_sum = Decimal("0")
-            any_cp = False
-            for cp_positions in by_cp.values():
-                # Each L1 row is one counterparty; sum of L1 within MG.
-                part = _sum_metrics(cp_positions, "total_debt")
+
+        for dept, positions in sorted(by_dept.items()):
+            dept_total_m = _sum_metrics(positions, metric)
+            by_mg: dict[int, list[PositionSnapshot]] = defaultdict(list)
+            for pos in positions:
+                by_mg[pos.manager_group_id].append(pos)
+            mg_sum = Decimal("0")
+            any_mg = False
+            for mg_positions in by_mg.values():
+                part = _sum_metrics(mg_positions, metric)
                 if part is not None:
-                    cp_sum += part
-                    any_cp = True
-            cp_total = cp_sum if any_cp else None
+                    mg_sum += part
+                    any_mg = True
+            mg_total = mg_sum if any_mg else None
             checks.append(
                 ControlEquality(
-                    name=f"manager_group_{mg_id}_vs_sum_counterparties",
-                    left=mg_total_m,
-                    right=cp_total,
-                    ok=_near(mg_total_m, cp_total),
+                    name=f"department_{dept}_{metric}_vs_sum_manager_groups",
+                    left=dept_total_m,
+                    right=mg_total,
+                    ok=_near(dept_total_m, mg_total),
                 )
             )
-
-    # credit_limit diagnostic only (may diverge from reported grand totals)
-    credit_sum = None
-    credit_acc = Decimal("0")
-    any_credit = False
-    for pos in l1:
-        if pos.credit_limit is None:
-            continue
-        credit_acc += pos.credit_limit
-        any_credit = True
-    if any_credit:
-        credit_sum = credit_acc
-    checks.append(
-        ControlEquality(
-            name="credit_limit_l1_sum_diagnostic",
-            left=credit_sum,
-            right=None,
-            ok=True,
-            diagnostic=True,
-        )
-    )
+            for mg_id, mg_positions in sorted(by_mg.items()):
+                mg_total_m = _sum_metrics(mg_positions, metric)
+                by_cp: dict[int, list[PositionSnapshot]] = defaultdict(list)
+                for pos in mg_positions:
+                    by_cp[pos.counterparty_id].append(pos)
+                cp_sum = Decimal("0")
+                any_cp = False
+                for cp_positions in by_cp.values():
+                    part = _sum_metrics(cp_positions, metric)
+                    if part is not None:
+                        cp_sum += part
+                        any_cp = True
+                cp_total = cp_sum if any_cp else None
+                checks.append(
+                    ControlEquality(
+                        name=(
+                            f"manager_group_{mg_id}_{metric}_vs_sum_counterparties"
+                        ),
+                        left=mg_total_m,
+                        right=cp_total,
+                        ok=_near(mg_total_m, cp_total),
+                    )
+                )
 
     checks.append(
         ControlEquality(
@@ -487,12 +498,70 @@ def build_l1_control_equalities(
     return tuple(checks)
 
 
-def _near(left: Decimal | None, right: Decimal | None) -> bool:
-    if left is None and right is None:
-        return True
-    if left is None or right is None:
-        return False
-    return abs(left - right) <= CONTROL_TOLERANCE
+def build_source_file_grand_total_equalities(
+    current: Sequence[PositionSnapshot],
+    reported_by_source_file: dict[int, dict[str, object | None]],
+) -> tuple[ControlEquality, ...]:
+    """Re-check stored L1 rows against SourceFile.reported_grand_totals."""
+    checks: list[ControlEquality] = []
+    l1_by_file: dict[int, list[PositionSnapshot]] = defaultdict(list)
+    for pos in current:
+        if pos.outline_level == 1:
+            l1_by_file[pos.source_file_id].append(pos)
+
+    for source_file_id in sorted(reported_by_source_file):
+        reported = reported_by_source_file[source_file_id] or {}
+        l1_rows = l1_by_file.get(source_file_id, [])
+        for metric in ADDITIVE_METRICS:
+            left = _sum_metrics(l1_rows, metric)
+            right = _parse_reported_metric(reported.get(metric))
+            checks.append(
+                ControlEquality(
+                    name=(
+                        f"source_file_{source_file_id}_{metric}"
+                        "_l1_vs_reported_grand_totals"
+                    ),
+                    left=left,
+                    right=right,
+                    ok=_near(left, right),
+                    diagnostic=False,
+                )
+            )
+
+        credit_left = _sum_credit_limit(l1_rows)
+        credit_right = _parse_reported_metric(reported.get("credit_limit"))
+        # Diagnostic only: may diverge; never explains total_debt mismatches.
+        checks.append(
+            ControlEquality(
+                name=(
+                    f"source_file_{source_file_id}_credit_limit"
+                    "_l1_vs_reported_grand_totals_diagnostic"
+                ),
+                left=credit_left,
+                right=credit_right,
+                ok=_near(credit_left, credit_right),
+                diagnostic=True,
+            )
+        )
+
+    return tuple(checks)
+
+
+async def load_active_reported_grand_totals(
+    session: AsyncSession, cycle_id: int
+) -> dict[int, dict[str, object | None]]:
+    rows = (
+        await session.execute(
+            select(SourceFile.id, SourceFile.reported_grand_totals).where(
+                SourceFile.audit_cycle_id == cycle_id,
+                SourceFile.lifecycle_status == SourceFileLifecycle.ACTIVE,
+            )
+        )
+    ).all()
+    out: dict[int, dict[str, object | None]] = {}
+    for file_id, totals in rows:
+        out[int(file_id)] = dict(totals or {})
+    return out
 
 
 async def compare_cycles(
@@ -514,7 +583,11 @@ async def compare_cycles(
     entities, collisions, ambiguous = compare_position_sets(
         current=current_positions, previous=previous_positions
     )
-    controls = build_l1_control_equalities(current_positions)
+    reported = await load_active_reported_grand_totals(session, current_cycle.id)
+    controls = (
+        build_l1_control_equalities(current_positions)
+        + build_source_file_grand_total_equalities(current_positions, reported)
+    )
     return CycleComparison(
         current_cycle_id=current_cycle.id,
         current_report_date=current_cycle.report_date,
