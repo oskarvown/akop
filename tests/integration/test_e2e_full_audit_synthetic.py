@@ -6,9 +6,8 @@
 
 Изоляция данных: использует фикстуру ``stage3_session_maker`` из
 ``tests/integration/conftest.py`` — перед и после теста полностью очищаются
-таблицы Stage 3 (audit_cycles, source_files, manager_groups, counterparties,
-debt_positions) в dev-БД из ``.env``. Отдельная test-БД не требуется;
-повторный прогон не зависит от предыдущих данных.
+таблицы Stage 3 в PostgreSQL. Cleanup разрешён только для БД ``*_test`` или при
+``ALLOW_DESTRUCTIVE_TEST_DB=1`` (см. ``tests/integration/db_safety.py``).
 
 Запуск: ``pytest -m e2e tests/integration/test_e2e_full_audit_synthetic.py``
 """

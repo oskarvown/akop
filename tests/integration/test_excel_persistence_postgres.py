@@ -12,7 +12,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from sqlalchemy import delete, select
+from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -22,6 +22,7 @@ from app.domain.models import Counterparty, DebtPosition, ManagerGroup, SourceFi
 from app.infrastructure.excel.checksum import compute_sha256
 from app.infrastructure.excel.persistence import persist_valid_source_file
 from app.infrastructure.excel.validator import validate_confirmed_template_file
+from tests.integration.pg_cleanup import clean_stage3_tables
 
 FIXTURES_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "regional"
 
@@ -34,7 +35,8 @@ async def db_session():
     # переиспользование глобального кэша между тестами роняет соединение
     # ("attached to a different loop"). Поэтому здесь — отдельный engine на тест,
     # с явным `dispose()` в конце.
-    engine = create_async_engine(get_settings().database_url, pool_pre_ping=True)
+    settings = get_settings()
+    engine = create_async_engine(settings.database_url, pool_pre_ping=True)
     session_maker = async_sessionmaker(bind=engine, expire_on_commit=False)
 
     try:
@@ -45,18 +47,13 @@ async def db_session():
         await engine.dispose()
         pytest.skip(f"Локальный PostgreSQL недоступен: {exc}")
 
-    async with session_maker() as session:
-        yield session
-        await session.rollback()
-
-    async with session_maker() as cleanup_session:
-        await cleanup_session.execute(delete(DebtPosition))
-        await cleanup_session.execute(delete(Counterparty))
-        await cleanup_session.execute(delete(SourceFile))
-        await cleanup_session.execute(delete(ManagerGroup))
-        await cleanup_session.commit()
-
-    await engine.dispose()
+    try:
+        async with session_maker() as session:
+            yield session
+            await session.rollback()
+    finally:
+        await clean_stage3_tables(session_maker, db_name=settings.db_name)
+        await engine.dispose()
 
 
 @pytest.mark.asyncio
