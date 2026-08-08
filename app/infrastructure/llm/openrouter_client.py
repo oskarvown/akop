@@ -92,6 +92,8 @@ def _parse_facts(payload: dict[str, Any]) -> LlmCommentFacts:
                 mentioned_amount = Decimal(str(raw_amount))
             except (InvalidOperation, ValueError, TypeError) as exc:
                 raise OpenRouterSchemaError("invalid amount") from exc
+            if not mentioned_amount.is_finite():
+                raise OpenRouterSchemaError("invalid amount")
         confidence = payload.get("confidence")
         if confidence is None:
             confidence = "none"
@@ -209,7 +211,10 @@ class OpenRouterClient:
                             raise OpenRouterSchemaError(
                                 f"openrouter_http_{resp.status}"
                             )
-                        data = await resp.json(content_type=None)
+                        try:
+                            data = await resp.json(content_type=None)
+                        except json.JSONDecodeError as exc:
+                            raise OpenRouterSchemaError("invalid response json") from exc
                     content = _extract_message_content(data)
                     try:
                         payload = json.loads(content)

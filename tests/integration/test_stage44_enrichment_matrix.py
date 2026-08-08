@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import uuid
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,10 +16,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.application.comment_enrichment_service import (
+    EnrichmentConflictError,
     claim_enrichment_job,
     compute_analysis_input_hash,
     enqueue_enrichment_job,
     fail_enrichment,
+    list_due_enrichment_job_ids,
     record_comment_analysis,
     run_claimed_enrichment,
 )
@@ -1035,8 +1038,9 @@ async def test_frozen_job_versions_ignore_settings_v2(
             select(CommentAnalysis).where(CommentAnalysis.enrichment_job_id == job_id)
         )
         assert analysis is not None
+        snap = job.input_snapshot_json[0]
         expected = compute_analysis_input_hash(
-            comment_raw="уточнить версию",
+            snapshot=snap,
             report_date=dt.date(2026, 12, 14),
             versions={
                 "parser_version": "1",
@@ -1092,3 +1096,237 @@ async def test_unsupported_frozen_parser_version_fails_controlled(
         assert job is not None
         assert job.status is CommentEnrichmentJobStatus.FAILED
         assert job.last_error and "unsupported_frozen_parser_version" in job.last_error
+
+
+@pytest.mark.asyncio
+async def test_list_due_enrichment_job_ids_skips_terminal_before_limit(
+    stage3_session_maker: async_sessionmaker[AsyncSession],
+    valid_result: ValidationResult,
+) -> None:
+    batch_size = 10
+    max_attempts = 5
+    settings = _settings(
+        comment_enrichment_batch_size=batch_size,
+        comment_enrichment_max_attempts=max_attempts,
+    )
+    now = dt.datetime(2026, 12, 20, 12, 0, tzinfo=dt.timezone.utc)
+
+    async with stage3_session_maker() as session:
+        cycle_id = await complete_cycle(
+            session,
+            valid_result,
+            report_date=dt.date(2026, 12, 20),
+            sha_prefix="s44c-due",
+        )
+        await session.commit()
+    report_id, _, _ = await build_ready_core(stage3_session_maker, cycle_id=cycle_id)
+
+    blocked_ids: list[int] = []
+    async with stage3_session_maker() as session:
+        for index in range(batch_size):
+            terminal = index % 2 == 0
+            blocked = CommentEnrichmentJob(
+                audit_report_id=report_id,
+                comment_analysis_batch_id=uuid.uuid4(),
+                enrichment_input_hash=f"blocked-{index}",
+                status=CommentEnrichmentJobStatus.FAILED,
+                attempt_count=max_attempts if terminal else 1,
+                next_retry_at=(
+                    None if terminal else now + dt.timedelta(hours=1)
+                ),
+                prompt_version="1",
+                model_name="m",
+                schema_version_llm="1",
+                redaction_version="1",
+                parser_version="1",
+                input_snapshot_json=[],
+            )
+            session.add(blocked)
+            await session.flush()
+            blocked_ids.append(int(blocked.id))
+        due_job = CommentEnrichmentJob(
+            audit_report_id=report_id,
+            comment_analysis_batch_id=uuid.uuid4(),
+            enrichment_input_hash="due-job",
+            status=CommentEnrichmentJobStatus.PENDING,
+            prompt_version="1",
+            model_name="m",
+            schema_version_llm="1",
+            redaction_version="1",
+            parser_version="1",
+            input_snapshot_json=[{"comment_raw": "x"}],
+        )
+        session.add(due_job)
+        await session.flush()
+        due_job_id = int(due_job.id)
+        due_failed = CommentEnrichmentJob(
+            audit_report_id=report_id,
+            comment_analysis_batch_id=uuid.uuid4(),
+            enrichment_input_hash="due-failed",
+            status=CommentEnrichmentJobStatus.FAILED,
+            attempt_count=1,
+            next_retry_at=now - dt.timedelta(minutes=1),
+            prompt_version="1",
+            model_name="m",
+            schema_version_llm="1",
+            redaction_version="1",
+            parser_version="1",
+            input_snapshot_json=[{"comment_raw": "y"}],
+        )
+        session.add(due_failed)
+        await session.flush()
+        due_failed_id = int(due_failed.id)
+        await session.commit()
+
+    async with stage3_session_maker() as session:
+        due_ids = await list_due_enrichment_job_ids(
+            session, settings=settings, now_utc=now
+        )
+
+    assert due_ids == [due_job_id, due_failed_id]
+    assert due_job_id > max(blocked_ids)
+    assert due_failed_id > max(blocked_ids)
+    assert not any(blocked_id in due_ids for blocked_id in blocked_ids)
+
+
+@pytest.mark.asyncio
+async def test_invalid_response_envelope_needs_review_not_job_failure(
+    stage3_session_maker: async_sessionmaker[AsyncSession],
+    valid_result: ValidationResult,
+) -> None:
+    async with stage3_session_maker() as session:
+        cycle_id = await complete_cycle(
+            session,
+            valid_result,
+            report_date=dt.date(2026, 12, 21),
+            sha_prefix="s44c-env",
+        )
+        await session.commit()
+    report_id, _, _ = await build_ready_core(stage3_session_maker, cycle_id=cycle_id)
+    settings = _settings(openrouter_api_key="k", openrouter_model="m")
+    await _set_only_comment(
+        stage3_session_maker,
+        comment="уточнить позже, email manager@example.com",
+    )
+    async with stage3_session_maker() as session:
+        job_id = await enqueue_enrichment_job(
+            session, report_id=report_id, settings=settings
+        )
+    async with stage3_session_maker() as session:
+        claim = await claim_enrichment_job(
+            session, job_id=job_id, settings=settings
+        )
+    assert claim is not None
+
+    class BadEnvelopeClient:
+        async def analyze_comment(self, **kwargs: object) -> LlmCommentFacts:
+            raise OpenRouterSchemaError("invalid response json")
+
+    result = await run_claimed_enrichment(
+        stage3_session_maker,
+        claim=claim,
+        settings=settings,
+        llm_client=BadEnvelopeClient(),  # type: ignore[arg-type]
+    )
+    assert result is not None
+    async with stage3_session_maker() as session:
+        job = await session.get(CommentEnrichmentJob, job_id)
+        assert job is not None
+        assert job.status is CommentEnrichmentJobStatus.READY
+        row = await session.scalar(
+            select(CommentAnalysis).where(CommentAnalysis.enrichment_job_id == job_id)
+        )
+        assert row is not None
+        assert row.analysis_status is CommentAnalysisStatus.NEEDS_REVIEW
+        assert row.parse_notes and "schema_invalid" in row.parse_notes
+
+
+@pytest.mark.asyncio
+async def test_record_analysis_raw_llm_json_idempotent_and_conflict(
+    stage3_session_maker: async_sessionmaker[AsyncSession],
+    valid_result: ValidationResult,
+) -> None:
+    async with stage3_session_maker() as session:
+        cycle_id = await complete_cycle(
+            session,
+            valid_result,
+            report_date=dt.date(2026, 12, 22),
+            sha_prefix="s44c-raw",
+        )
+        await session.commit()
+    report_id, _, _ = await build_ready_core(stage3_session_maker, cycle_id=cycle_id)
+    settings = _settings(openrouter_api_key="k", openrouter_model="m")
+    await _set_only_comment(stage3_session_maker, comment="уточнить детали")
+    async with stage3_session_maker() as session:
+        job_id = await enqueue_enrichment_job(
+            session, report_id=report_id, settings=settings
+        )
+    async with stage3_session_maker() as session:
+        claim = await claim_enrichment_job(
+            session, job_id=job_id, settings=settings
+        )
+    assert claim is not None
+    async with stage3_session_maker() as session:
+        pos = await session.scalar(select(DebtPosition).limit(1))
+        assert pos is not None
+        position_id = int(pos.id)
+
+    raw_a = {"confidence": "low", "summary": "ok", "extra": 1}
+    raw_b = {"extra": 1, "summary": "ok", "confidence": "low"}
+    raw_c = {"confidence": "low", "summary": "different", "extra": 1}
+
+    async with stage3_session_maker() as session:
+        ok = await record_comment_analysis(
+            session,
+            job_id=job_id,
+            claim_token=claim.claim_token,
+            debt_position_id=position_id,
+            analysis_input_hash="h-raw",
+            comment_raw="уточнить детали",
+            source=CommentAnalysisSource.LLM,
+            analysis_status=CommentAnalysisStatus.RESOLVED,
+            confidence=CommentAnalysisConfidence.LOW,
+            summary="ok",
+            raw_llm_json=raw_a,
+        )
+        assert ok is True
+
+    async with stage3_session_maker() as session:
+        ok2 = await record_comment_analysis(
+            session,
+            job_id=job_id,
+            claim_token=claim.claim_token,
+            debt_position_id=position_id,
+            analysis_input_hash="h-raw",
+            comment_raw="уточнить детали",
+            source=CommentAnalysisSource.LLM,
+            analysis_status=CommentAnalysisStatus.RESOLVED,
+            confidence=CommentAnalysisConfidence.LOW,
+            summary="ok",
+            raw_llm_json=raw_b,
+        )
+        assert ok2 is True
+
+    async with stage3_session_maker() as session:
+        with pytest.raises(EnrichmentConflictError):
+            await record_comment_analysis(
+                session,
+                job_id=job_id,
+                claim_token=claim.claim_token,
+                debt_position_id=position_id,
+                analysis_input_hash="h-raw",
+                comment_raw="уточнить детали",
+                source=CommentAnalysisSource.LLM,
+                analysis_status=CommentAnalysisStatus.RESOLVED,
+                confidence=CommentAnalysisConfidence.LOW,
+                summary="ok",
+                raw_llm_json=raw_c,
+            )
+
+    async with stage3_session_maker() as session:
+        count = await session.scalar(
+            select(func.count()).select_from(CommentAnalysis).where(
+                CommentAnalysis.enrichment_job_id == job_id
+            )
+        )
+        assert count == 1

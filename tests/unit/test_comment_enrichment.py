@@ -14,6 +14,29 @@ from app.domain.calculations.comment_parser import (
     parse_comment,
 )
 
+_VERSIONS = {
+    "parser_version": "1",
+    "prompt_version": "1",
+    "schema_version_llm": "1",
+    "redaction_version": "1",
+    "model_name": "m",
+}
+
+
+def _snapshot(**overrides: object) -> dict[str, object]:
+    base: dict[str, object] = {
+        "debt_position_id": 1,
+        "source_file_id": 1,
+        "row_order": 1,
+        "department": "regional",
+        "manager_group": "m",
+        "counterparty_label": "c",
+        "outline_level": 1,
+        "comment_raw": "x",
+    }
+    base.update(overrides)
+    return base
+
 
 def test_year_without_year_uses_report_date_and_rollover() -> None:
     report = dt.date(2026, 8, 8)
@@ -40,43 +63,43 @@ def test_parse_comment_resolved_and_ambiguous() -> None:
     assert empty.outcome is CommentParseOutcome.EMPTY
 
 
-def test_hashes_include_report_date() -> None:
-    versions = {
-        "parser_version": "1",
-        "prompt_version": "1",
-        "schema_version_llm": "1",
-        "redaction_version": "1",
-        "model_name": "m",
-    }
+def test_analysis_hash_differs_by_report_date() -> None:
+    snap = _snapshot()
     a = compute_analysis_input_hash(
-        comment_raw="x", report_date=dt.date(2026, 1, 1), versions=versions
+        snapshot=snap, report_date=dt.date(2026, 1, 1), versions=_VERSIONS
     )
     b = compute_analysis_input_hash(
-        comment_raw="x", report_date=dt.date(2026, 1, 2), versions=versions
+        snapshot=snap, report_date=dt.date(2026, 1, 2), versions=_VERSIONS
     )
     assert a != b
-    snap = [
-        {
-            "debt_position_id": 1,
-            "comment_raw": "x",
-            "source_file_id": 1,
-            "row_order": 1,
-            "department": "regional",
-            "manager_group": "m",
-            "counterparty_label": "c",
-            "outline_level": 1,
-        }
-    ]
+
+
+def test_analysis_hash_differs_by_counterparty_label() -> None:
+    a = compute_analysis_input_hash(
+        snapshot=_snapshot(counterparty_label="Alpha"),
+        report_date=dt.date(2026, 1, 1),
+        versions=_VERSIONS,
+    )
+    b = compute_analysis_input_hash(
+        snapshot=_snapshot(counterparty_label="Beta"),
+        report_date=dt.date(2026, 1, 1),
+        versions=_VERSIONS,
+    )
+    assert a != b
+
+
+def test_enrichment_hash_includes_report_date() -> None:
+    snap = [_snapshot()]
     h1 = compute_enrichment_input_hash(
         snapshot=snap,
         report_date=dt.date(2026, 1, 1),
         financial_input_hash="abc",
-        versions=versions,
+        versions=_VERSIONS,
     )
     h2 = compute_enrichment_input_hash(
         snapshot=snap,
         report_date=dt.date(2026, 1, 2),
         financial_input_hash="abc",
-        versions=versions,
+        versions=_VERSIONS,
     )
     assert h1 != h2

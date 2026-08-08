@@ -73,6 +73,22 @@ def test_parse_facts_invalid_amount_and_confidence() -> None:
         _parse_facts(base)
 
 
+@pytest.mark.parametrize("amount", ["NaN", "Infinity", "-Infinity", "nan"])
+def test_parse_facts_rejects_non_finite_amount(amount: str) -> None:
+    with pytest.raises(OpenRouterSchemaError, match="invalid amount"):
+        _parse_facts(
+            {
+                "mentioned_date": None,
+                "mentioned_amount": amount,
+                "action": None,
+                "reason": None,
+                "responsible_person": None,
+                "summary": None,
+                "confidence": "low",
+            }
+        )
+
+
 @pytest.mark.asyncio
 async def test_openrouter_retries_transient_http_then_succeeds() -> None:
     calls = {"n": 0}
@@ -228,3 +244,42 @@ async def test_openrouter_exhausts_retries_on_429() -> None:
             comment_raw="x", report_date=date(2026, 1, 1), counterparty_label=None
         )
     assert calls["n"] == 3
+
+
+@pytest.mark.asyncio
+async def test_openrouter_invalid_response_envelope_is_schema_error_no_retry() -> None:
+    calls = {"n": 0}
+
+    class FakeResp:
+        status = 200
+
+        async def json(self, content_type: object = None) -> dict[str, Any]:
+            raise json.JSONDecodeError("bad", "not-json", 0)
+
+        async def __aenter__(self) -> FakeResp:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+    class FakeSession:
+        def post(self, *args: object, **kwargs: object) -> FakeResp:
+            calls["n"] += 1
+            return FakeResp()
+
+        async def close(self) -> None:
+            return None
+
+    client = OpenRouterClient(
+        api_key="k",
+        base_url="https://example.test/v1",
+        model="m",
+        timeout_seconds=5,
+        max_retries=3,
+        session=FakeSession(),  # type: ignore[arg-type]
+    )
+    with pytest.raises(OpenRouterSchemaError, match="invalid response json"):
+        await client.analyze_comment(
+            comment_raw="x", report_date=date(2026, 1, 1), counterparty_label=None
+        )
+    assert calls["n"] == 1

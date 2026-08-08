@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Mapping
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
 
@@ -142,14 +142,26 @@ def _stable_json(value: Any) -> str:
 
 def compute_analysis_input_hash(
     *,
-    comment_raw: str,
+    snapshot: Mapping[str, Any],
     report_date: dt.date,
     versions: Mapping[str, str],
 ) -> str:
+    """Hash canonical per-comment snapshot + report_date + frozen versions."""
     payload = {
-        "comment_raw": comment_raw,
+        "debt_position_id": int(snapshot["debt_position_id"]),
+        "source_file_id": int(snapshot["source_file_id"]),
+        "row_order": int(snapshot["row_order"]),
+        "department": str(snapshot["department"]),
+        "manager_group": str(snapshot["manager_group"]),
+        "counterparty_label": str(snapshot.get("counterparty_label") or ""),
+        "outline_level": int(snapshot["outline_level"]),
+        "comment_raw": str(snapshot["comment_raw"]),
         "report_date": report_date.isoformat(),
-        **dict(versions),
+        "parser_version": str(versions["parser_version"]),
+        "prompt_version": str(versions["prompt_version"]),
+        "schema_version_llm": str(versions["schema_version_llm"]),
+        "redaction_version": str(versions["redaction_version"]),
+        "model_name": str(versions["model_name"]),
     }
     return hashlib.sha256(_stable_json(payload).encode("utf-8")).hexdigest()
 
@@ -369,6 +381,11 @@ async def list_due_enrichment_job_ids(
     now_utc: dt.datetime | None = None,
     limit: int | None = None,
 ) -> list[int]:
+    """Return PENDING and retryable FAILED enrichment job ids.
+
+    Due filtering is applied in SQL before LIMIT so terminal/not-due rows cannot
+    starve newer ready jobs (Stage 4.4 regression).
+    """
     now = _ensure_utc(now_utc or dt.datetime.now(dt.timezone.utc))
     max_attempts = int(settings.comment_enrichment_max_attempts)  # type: ignore[attr-defined]
     row_limit = (
@@ -381,30 +398,27 @@ async def list_due_enrichment_job_ids(
     async with session.begin():
         rows = (
             await session.execute(
-                select(CommentEnrichmentJob)
+                select(CommentEnrichmentJob.id)
                 .where(
-                    CommentEnrichmentJob.status.in_(
-                        (
-                            CommentEnrichmentJobStatus.PENDING,
-                            CommentEnrichmentJobStatus.FAILED,
-                        )
+                    or_(
+                        CommentEnrichmentJob.status
+                        == CommentEnrichmentJobStatus.PENDING,
+                        and_(
+                            CommentEnrichmentJob.status
+                            == CommentEnrichmentJobStatus.FAILED,
+                            CommentEnrichmentJob.attempt_count < max_attempts,
+                            or_(
+                                CommentEnrichmentJob.next_retry_at.is_(None),
+                                CommentEnrichmentJob.next_retry_at <= now,
+                            ),
+                        ),
                     )
                 )
                 .order_by(CommentEnrichmentJob.id)
                 .limit(row_limit)
             )
         ).scalars().all()
-        due: list[int] = []
-        for job in rows:
-            if job.status is CommentEnrichmentJobStatus.PENDING:
-                due.append(int(job.id))
-                continue
-            if int(job.attempt_count) >= max_attempts and job.next_retry_at is None:
-                continue
-            if job.next_retry_at is not None and _ensure_utc(job.next_retry_at) > now:
-                continue
-            due.append(int(job.id))
-        return due
+        return list(rows)
 
 
 async def claim_enrichment_job(
@@ -452,6 +466,12 @@ async def claim_enrichment_job(
         )
 
 
+def _canonical_raw_llm_json(value: dict[str, Any] | None) -> Any:
+    if value is None:
+        return None
+    return json.loads(_stable_json(value))
+
+
 def _analysis_payload_dict(row: CommentAnalysis) -> dict[str, Any]:
     return {
         "analysis_input_hash": row.analysis_input_hash,
@@ -468,6 +488,7 @@ def _analysis_payload_dict(row: CommentAnalysis) -> dict[str, Any]:
         "responsible_person": row.responsible_person,
         "summary": row.summary,
         "parse_notes": row.parse_notes,
+        "raw_llm_json": _canonical_raw_llm_json(row.raw_llm_json),
     }
 
 
@@ -521,6 +542,7 @@ async def record_comment_analysis(
             "responsible_person": responsible_person,
             "summary": summary,
             "parse_notes": parse_notes,
+            "raw_llm_json": _canonical_raw_llm_json(raw_llm_json),
         }
         if existing is not None:
             if _analysis_payload_dict(existing) == incoming:
@@ -811,7 +833,7 @@ async def run_claimed_enrichment(
                 continue
             comment_raw = str(snap["comment_raw"])
             analysis_hash = compute_analysis_input_hash(
-                comment_raw=comment_raw,
+                snapshot=snap,
                 report_date=report_date,
                 versions=versions,
             )
