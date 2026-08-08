@@ -562,7 +562,6 @@ async def _prompt_undo_confirmation(
 ) -> None:
     if target is None:
         return
-    data = await state.get_data()
     undo_token = uuid4().hex[:12]
     await state.set_state(UploadStates.confirming_undo)
     await state.update_data(undo_token=undo_token)
